@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 
 class CSVStore:
@@ -19,3 +19,10 @@ class CSVStore:
             return
         with csv_path.open("w", encoding="utf-8", newline="") as handle:
             csv.writer(handle).writerow(list(header))
+
+    def _row_to_list(
+        self, row: Mapping[str, Any], header: Sequence[str]
+    ) -> list[Any]:
+        """Serialize a mapping in canonical header order, filling missing cells."""
+
+        return [row.get(column, "") for column in header]

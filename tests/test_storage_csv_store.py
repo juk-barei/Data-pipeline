@@ -33,3 +33,11 @@ def test_init_file_never_changes_nonempty_file(tmp_path):
     bare_store()._init_file(path, ["new", "header"])
 
     assert path.read_bytes() == original
+
+
+def test_row_to_list_uses_header_order_and_fills_missing_cells():
+    row = {"created_at": "2026-01-01", "address": "T123", "ignored": "value"}
+
+    result = bare_store()._row_to_list(row, ["address", "hex_address", "created_at"])
+
+    assert result == ["T123", "", "2026-01-01"]
