@@ -552,3 +552,73 @@ def test_insert_seeds_retries_after_dependency_write_failure(tmp_path, monkeypat
     assert set(reopened.accounts) == {address}
     assert set(reopened.crawl_state) == {address}
     assert reopened.crawl_state[address]["hop_level"] == 0
+
+
+def test_upsert_crawled_data_deduplicates_transactions_and_updates_indexes(tmp_path):
+    store = CSVStore(str(tmp_path))
+    address = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    store.insert_seeds([{"wallet_address": address, "label": 0}])
+    original_hex = store.accounts[address]["hex_address"]
+    original_created_at = store.accounts[address]["created_at"]
+    huge_amount = "9007199254740993.000000"
+    tx = {
+        "tx_hash": "h1", "from_address": address, "to_address": "T-destination",
+        "amount": huge_amount, "token_symbol": "USDT",
+    }
+
+    store.upsert_crawled_data(
+        [{"address": address, "last_seen_timestamp": "latest"}],
+        [tx, dict(tx)],
+        [address],
+        [address],
+    )
+    store.upsert_crawled_data([], [dict(tx)], [address], [address])
+
+    assert list(store._iter_rows(store.transactions_path)) == [
+        {**{column: "" for column in store.headers["transactions.csv"]}, **tx}
+    ]
+    assert store.tx_hashes == {"h1"}
+    assert store.wallet_tx_hashes[address] == {"h1"}
+    assert store.wallet_tx_hashes["T-destination"] == {"h1"}
+    assert store.transactions_path.read_bytes()[store.tx_offsets["h1"] :].startswith(b"h1,")
+    assert store.crawl_state[address]["synced"] is True
+    assert store.crawl_state[address]["is_supernode"] is True
+    assert store.accounts[address]["hex_address"] == original_hex
+    assert store.accounts[address]["created_at"] == original_created_at
+
+    reopened = CSVStore(str(tmp_path))
+    assert reopened.tx_hashes == {"h1"}
+    assert list(reopened._iter_rows(reopened.transactions_path))[0]["amount"] == huge_amount
+    assert reopened.accounts[address]["hex_address"] == original_hex
+    assert reopened.accounts[address]["created_at"] == original_created_at
+
+
+def test_upsert_crawled_data_failure_reloads_unsynced_state_and_can_retry(tmp_path, monkeypatch):
+    store = CSVStore(str(tmp_path))
+    address = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    store.insert_seeds([{"wallet_address": address, "label": 0}])
+    real_append = store._append_rows
+    failed = False
+
+    def fail_transaction_once(path, header, rows):
+        nonlocal failed
+        if path == store.transactions_path and not failed:
+            failed = True
+            raise OSError("synthetic transaction append failure")
+        real_append(path, header, rows)
+
+    monkeypatch.setattr(store, "_append_rows", fail_transaction_once)
+    tx = {"tx_hash": "retry-hash", "from_address": address, "to_address": "T2", "amount": "42"}
+    with pytest.raises(OSError, match="synthetic transaction append failure"):
+        store.upsert_crawled_data(
+            [{"address": address, "last_seen_timestamp": "durable-account"}],
+            [tx],
+            [address],
+            [],
+        )
+
+    assert store.crawl_state[address]["synced"] is False
+    assert "retry-hash" not in store.tx_hashes
+    store.upsert_crawled_data([], [tx], [address], [])
+    assert store.crawl_state[address]["synced"] is True
+    assert store.tx_hashes == {"retry-hash"}

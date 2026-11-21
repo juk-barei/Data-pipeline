@@ -397,3 +397,77 @@ class CSVStore:
                 if added_state:
                     self.crawl_state.pop(address, None)
                 raise
+
+    def upsert_crawled_data(
+        self,
+        accounts: Sequence[Mapping[str, Any]],
+        txs: Sequence[Mapping[str, Any]],
+        synced: Sequence[str],
+        supernodes: Sequence[str],
+    ) -> None:
+        """Durably apply a crawl batch before marking its frontier complete."""
+
+        synced_addresses = list(dict.fromkeys(synced))
+        supernode_set = set(supernodes)
+        state_addresses = list(dict.fromkeys([*synced_addresses, *supernodes]))
+        missing_states = [address for address in state_addresses if address not in self.crawl_state]
+        if missing_states:
+            raise ValueError(f"crawl state missing for: {', '.join(missing_states)}")
+
+        try:
+            changed_accounts: list[str] = []
+            for supplied in accounts:
+                address = str(supplied.get("address", ""))
+                if not address:
+                    raise ValueError("account address is required")
+                timestamp = now_iso()
+                merged = dict(self.accounts.get(address, {}))
+                merged.update(supplied)
+                merged.setdefault("address", address)
+                merged.setdefault("created_at", timestamp)
+                merged.setdefault("created_date", timestamp[:10])
+                self.accounts[address] = merged
+                changed_accounts.append(address)
+            self._append_account_rows(changed_accounts)
+
+            for supplied in txs:
+                tx_hash = str(supplied.get("tx_hash", ""))
+                if not tx_hash:
+                    raise ValueError("transaction tx_hash is required")
+                if tx_hash in self.tx_hashes:
+                    continue
+
+                old_size = self.transactions_path.stat().st_size
+                separator_size = 0
+                if old_size:
+                    with self.transactions_path.open("rb") as existing:
+                        existing.seek(-1, os.SEEK_END)
+                        if existing.read(1) not in (b"\n", b"\r"):
+                            separator_size = 2
+                row = dict(supplied)
+                self._append_rows(
+                    self.transactions_path,
+                    self.headers["transactions.csv"],
+                    [row],
+                )
+                self.tx_hashes.add(tx_hash)
+                self.tx_offsets[tx_hash] = old_size + separator_size
+                for address in {row.get("from_address", ""), row.get("to_address", "")}:
+                    if address:
+                        self.wallet_tx_hashes.setdefault(str(address), set()).add(tx_hash)
+
+            timestamp = now_iso()
+            for address in state_addresses:
+                state = self.crawl_state[address]
+                if address in synced_addresses:
+                    state["synced"] = True
+                if address in supernode_set:
+                    state["is_supernode"] = True
+                state["updated_at"] = timestamp
+            self._append_crawl_state_rows(state_addresses)
+        except Exception:
+            try:
+                self.load()
+            except Exception:
+                logger.exception("failed to reload CSV state after crawl-batch error")
+            raise
