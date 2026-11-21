@@ -1,5 +1,7 @@
 import csv
 
+import pytest
+
 from pipeline.storage.csv_store import CSVStore
 
 
@@ -79,3 +81,47 @@ def test_append_rows_writes_header_for_new_file_and_empty_batch_is_noop(tmp_path
         assert list(csv.reader(handle)) == [["tx_hash", "amount"], ["abc", ""]]
     assert path.read_bytes() == before
     assert store._appended_since_compact == 1
+
+
+def test_write_snapshot_replaces_file_with_complete_csv(tmp_path, monkeypatch):
+    path = tmp_path / "accounts.csv"
+    path.write_text("old,data\n", encoding="utf-8")
+    fsync_calls = []
+    monkeypatch.setattr("pipeline.storage.csv_store.os.fsync", fsync_calls.append)
+
+    bare_store()._write_snapshot(
+        path,
+        ["address", "created_at"],
+        [{"address": "T1", "created_at": "now"}],
+    )
+
+    with path.open(encoding="utf-8", newline="") as handle:
+        assert list(csv.reader(handle)) == [
+            ["address", "created_at"],
+            ["T1", "now"],
+        ]
+    assert len(fsync_calls) == 1
+    assert not (tmp_path / "accounts.csv.tmp").exists()
+
+
+def test_write_snapshot_replace_failure_preserves_old_file(tmp_path, monkeypatch):
+    path = tmp_path / "accounts.csv"
+    original = b"address,created_at\r\nT-old,before\r\n"
+    path.write_bytes(original)
+
+    def fail_replace(source, destination):
+        assert source == tmp_path / "accounts.csv.tmp"
+        assert destination == path
+        raise OSError("synthetic replace failure")
+
+    monkeypatch.setattr("pipeline.storage.csv_store.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="synthetic replace failure"):
+        bare_store()._write_snapshot(path, ["address", "created_at"], [{"address": "T-new"}])
+
+    assert path.read_bytes() == original
+    with (tmp_path / "accounts.csv.tmp").open(encoding="utf-8", newline="") as handle:
+        assert list(csv.reader(handle)) == [
+            ["address", "created_at"],
+            ["T-new", ""],
+        ]
