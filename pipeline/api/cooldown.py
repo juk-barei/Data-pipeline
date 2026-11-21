@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 
 class CooldownTracker:
@@ -13,3 +14,8 @@ class CooldownTracker:
             raise ValueError("cooldown_sec must be finite and nonnegative")
         self.cooldown_sec = cooldown_sec
         self.cooldowns: dict[str, float] = {}
+
+    def is_available(self, key: str) -> bool:
+        """Return whether this key has no active cooldown."""
+        deadline = self.cooldowns.get(key)
+        return deadline is None or time.monotonic() >= deadline
