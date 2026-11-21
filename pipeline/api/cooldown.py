@@ -19,3 +19,10 @@ class CooldownTracker:
         """Return whether this key has no active cooldown."""
         deadline = self.cooldowns.get(key)
         return deadline is None or time.monotonic() >= deadline
+
+
+    def penalize(self, key: str, seconds: int) -> None:
+        """Replace this key's deadline with monotonic now plus seconds."""
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("seconds must be finite and nonnegative")
+        self.cooldowns[key] = time.monotonic() + seconds

@@ -36,3 +36,33 @@ def test_cooldown_expiry_uses_monotonic_boundary(monkeypatch, now, expected):
     monkeypatch.setattr("time.time", lambda: -1_000_000)
     assert tracker.is_available("one") is expected
     assert tracker.is_available("two") is True
+
+
+def test_penalty_is_immediate_isolated_and_expires(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr("pipeline.api.cooldown.time.monotonic", lambda: now[0])
+    tracker = CooldownTracker(60)
+    assert tracker.penalize("one", 5) is None
+    assert tracker.cooldowns == {"one": 15.0}
+    assert not tracker.is_available("one")
+    assert tracker.is_available("two")
+    now[0] = 15.0
+    assert tracker.is_available("one")
+
+
+def test_penalty_replaces_deadline_and_zero_expires_immediately(monkeypatch):
+    monkeypatch.setattr("pipeline.api.cooldown.time.monotonic", lambda: 10.0)
+    tracker = CooldownTracker(60)
+    tracker.penalize("one", 30)
+    tracker.penalize("one", 2)
+    assert tracker.cooldowns["one"] == 12.0
+    tracker.penalize("one", 0)
+    assert tracker.is_available("one")
+
+
+@pytest.mark.parametrize("seconds", [-1, float("inf"), float("nan")])
+def test_invalid_penalty_does_not_change_state(seconds):
+    tracker = CooldownTracker(60)
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        tracker.penalize("one", seconds)
+    assert tracker.cooldowns == {}
