@@ -843,3 +843,60 @@ def test_add_expansion_requires_frontier_seed_before_any_write(tmp_path):
         )
 
     assert {name: path.read_bytes() for name, path in store.paths.items()} == before
+
+
+def test_compact_rewrites_latest_logs_and_leaves_other_files_and_indexes_untouched(tmp_path):
+    store = CSVStore(str(tmp_path))
+    address = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    store.insert_seeds([{"wallet_address": address, "label": 0}])
+    store.upsert_crawled_data(
+        [{"address": address, "last_seen_timestamp": "one"}],
+        [{"tx_hash": "h1", "from_address": address, "to_address": "T2"}],
+        [address],
+        [],
+    )
+    store.upsert_crawled_data(
+        [{"address": address, "last_seen_timestamp": "two"}], [], [address], []
+    )
+    untouched_before = {
+        name: store.paths[name].read_bytes()
+        for name in ("seed_wallets.csv", "transactions.csv", "wallet_hops.csv")
+    }
+    offsets_before = dict(store.tx_offsets)
+    assert len(list(store._iter_rows(store.accounts_path))) > len(store.accounts)
+    assert len(list(store._iter_rows(store.crawl_state_path))) > len(store.crawl_state)
+
+    store.compact()
+
+    assert len(list(store._iter_rows(store.accounts_path))) == len(store.accounts)
+    assert len(list(store._iter_rows(store.crawl_state_path))) == len(store.crawl_state)
+    assert {
+        name: store.paths[name].read_bytes() for name in untouched_before
+    } == untouched_before
+    assert store.tx_offsets == offsets_before
+    assert store._appended_since_compact == 0
+    reopened = CSVStore(str(tmp_path))
+    assert reopened.accounts[address]["last_seen_timestamp"] == "two"
+    assert reopened.crawl_state[address]["synced"] is True
+
+
+def test_compact_second_snapshot_failure_keeps_counter_and_coherent_first_file(tmp_path, monkeypatch):
+    store = CSVStore(str(tmp_path))
+    address = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    store.insert_seeds([{"wallet_address": address, "label": 0}])
+    store.accounts[address]["last_seen_timestamp"] = "latest"
+    store._append_account_rows([address])
+    counter_before = store._appended_since_compact
+    real_write = store._write_snapshot
+
+    def fail_crawl(path, header, rows):
+        if path == store.crawl_state_path:
+            raise OSError("synthetic crawl snapshot failure")
+        real_write(path, header, rows)
+
+    monkeypatch.setattr(store, "_write_snapshot", fail_crawl)
+    with pytest.raises(OSError, match="synthetic crawl snapshot failure"):
+        store.compact()
+
+    assert store._appended_since_compact == counter_before
+    assert list(store._iter_rows(store.accounts_path)) == [store.accounts[address]]

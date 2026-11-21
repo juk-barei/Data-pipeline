@@ -688,3 +688,29 @@ class CSVStore:
             except Exception:
                 logger.exception("failed to reload CSV state after expansion write error")
             raise
+
+    def compact(self) -> None:
+        """Rewrite append-log account and crawl state as canonical snapshots."""
+
+        account_rows = [dict(row) for row in self.accounts.values()]
+        crawl_rows: list[dict[str, Any]] = []
+        for source in self.crawl_state.values():
+            row = dict(source)
+            for field in ("synced", "expanded", "is_supernode"):
+                value = source.get(field)
+                if type(value) is not bool:
+                    raise ValueError(f"crawl-state {field} must be bool")
+                row[field] = "TRUE" if value else "FALSE"
+            crawl_rows.append(row)
+
+        self._write_snapshot(
+            self.accounts_path,
+            self.headers["accounts.csv"],
+            account_rows,
+        )
+        self._write_snapshot(
+            self.crawl_state_path,
+            self.headers["pipeline_crawl_state.csv"],
+            crawl_rows,
+        )
+        self._appended_since_compact = 0
