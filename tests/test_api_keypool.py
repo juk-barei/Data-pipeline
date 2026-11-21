@@ -161,3 +161,46 @@ def test_cancellation_while_waiting_leaves_pool_usable(monkeypatch):
         assert await pool.get_key() == "one"
 
     asyncio.run(scenario())
+
+
+def test_pool_penalty_uses_default_and_masks_key(clock, caplog):
+    secret = "private-api-key-123"
+    pool = MultiKeyPool([secret, "healthy"], 60)
+    with caplog.at_level(logging.WARNING, logger="pipeline.api.keypool"):
+        assert pool.penalize(secret) is None
+    assert pool.cooldown.cooldowns[secret] == 160.0
+    assert secret not in caplog.text
+    assert "privat..." in caplog.text
+    assert asyncio.run(pool.get_key()) == "healthy"
+    assert clock.sleeps == []
+
+
+def test_explicit_pool_penalty_expires_and_returns_to_rotation(clock):
+    pool = MultiKeyPool(["one", "two"], 60)
+    pool.penalize("one", 5)
+    assert asyncio.run(pool.get_key()) == "two"
+    clock.now += 5
+    assert asyncio.run(pool.get_key()) == "one"
+    assert clock.sleeps == []
+
+
+def test_zero_pool_penalty_is_not_replaced_by_default(clock):
+    pool = MultiKeyPool(["one"], 60)
+    pool.penalize("one", 0)
+    assert asyncio.run(pool.get_key()) == "one"
+    assert clock.sleeps == []
+
+
+def test_unknown_pool_key_does_not_interrupt_healthy_keys(clock):
+    pool = MultiKeyPool(["one"], 60)
+    pool.penalize("unknown", 60)
+    assert pool.keys == ["one"]
+    assert asyncio.run(pool.get_key()) == "one"
+
+
+def test_negative_pool_penalty_preserves_existing_deadline(clock):
+    pool = MultiKeyPool(["one"], 60)
+    pool.penalize("one", 5)
+    with pytest.raises(ValueError):
+        pool.penalize("one", -1)
+    assert pool.cooldown.cooldowns["one"] == 105.0

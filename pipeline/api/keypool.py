@@ -8,6 +8,7 @@ import math
 import time
 
 from pipeline.api.cooldown import CooldownTracker
+from pipeline.utils.security import mask_key
 
 logger = logging.getLogger(__name__)
 
@@ -60,3 +61,10 @@ class MultiKeyPool:
             # Never hold the rotation lock while waiting: other keys and callers
             # must remain independent, and cancellation must release all state.
             await asyncio.sleep(delay)
+
+
+    def penalize(self, key: str, seconds: int | None = None) -> None:
+        """Cool only the failing key and redact its value in logs."""
+        duration = self.cooldown.cooldown_sec if seconds is None else seconds
+        self.cooldown.penalize(key, duration)
+        logger.warning("API key %s cooling for %s seconds", mask_key(key), duration)
