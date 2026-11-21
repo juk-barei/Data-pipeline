@@ -1017,3 +1017,61 @@ def test_reset_to_seeds_restart_rolls_forward_after_mid_reset_failure(tmp_path, 
     assert recovered.crawl_state[seed]["hop_level"] == 0
     assert recovered.crawl_state[seed]["synced"] is False
     assert not recovered._reset_marker_path.exists()
+
+
+def test_get_metrics_empty_dataset_is_incomplete_and_uses_no_disk(tmp_path, monkeypatch):
+    store = CSVStore(str(tmp_path))
+    monkeypatch.setattr(
+        store,
+        "_iter_rows",
+        lambda _path: (_ for _ in ()).throw(AssertionError("disk read")),
+    )
+
+    metrics = store.get_metrics()
+
+    assert metrics == {
+        "total_seeds": 0,
+        "total_accounts": 0,
+        "total_transactions": 0,
+        "total_hops": 0,
+        "total_crawl_states": 0,
+        "supernodes": 0,
+        "pending_crawls": 0,
+        "pending_expands": 0,
+        "per_hop": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+        "finished_seeds": 0,
+        "is_complete": False,
+    }
+
+
+def test_get_metrics_counts_all_seed_descendants_before_finished(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.seeds = {"S1": {}, "S2": {}}
+    store.accounts = {"S1": {}, "S2": {}, "C1": {}, "C2": {}, "C3": {}}
+    store.tx_hashes = {"h1", "h2"}
+    store.hops = [{}, {}]
+    store.crawl_state = {
+        "S1": {"address": "S1", "seed_address": "S1", "hop_level": 0, "synced": True, "expanded": True, "is_supernode": False},
+        "C1": {"address": "C1", "seed_address": "S1", "hop_level": 1, "synced": True, "expanded": True, "is_supernode": False},
+        "S2": {"address": "S2", "seed_address": "S2", "hop_level": 0, "synced": True, "expanded": True, "is_supernode": False},
+        "C2": {"address": "C2", "seed_address": "S2", "hop_level": 5, "synced": True, "expanded": False, "is_supernode": False},
+        "C3": {"address": "C3", "seed_address": "S2", "hop_level": 2, "synced": True, "expanded": False, "is_supernode": True},
+    }
+
+    metrics = store.get_metrics()
+
+    assert metrics["total_accounts"] == 5
+    assert metrics["total_transactions"] == 2
+    assert metrics["total_hops"] == 2
+    assert metrics["pending_crawls"] == 0
+    assert metrics["pending_expands"] == 2
+    assert metrics["per_hop"] == {0: 2, 1: 1, 2: 1, 3: 0, 4: 0, 5: 1}
+    assert metrics["supernodes"] == 1
+    assert metrics["finished_seeds"] == 1
+    assert metrics["is_complete"] is False
+
+    store.crawl_state["C2"]["expanded"] = True
+    store.crawl_state["C3"]["expanded"] = True
+    completed = store.get_metrics()
+    assert completed["finished_seeds"] == 2
+    assert completed["is_complete"] is True

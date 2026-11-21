@@ -795,3 +795,40 @@ class CSVStore:
 
         self.load()
         self._appended_since_compact = 0
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Compute health and completion metrics entirely from in-memory indexes."""
+
+        states = list(self.crawl_state.values())
+        pending_crawls = sum(not row["synced"] for row in states)
+        pending_expands = sum(
+            row["synced"] and not row["expanded"] for row in states
+        )
+        per_hop = {
+            level: sum(row["hop_level"] == level for row in states)
+            for level in range(6)
+        }
+
+        finished_seeds = 0
+        for seed in self.seeds:
+            seed_states = [row for row in states if row.get("seed_address") == seed]
+            if seed_states and all(
+                row["synced"] and row["expanded"] for row in seed_states
+            ):
+                finished_seeds += 1
+
+        return {
+            "total_seeds": len(self.seeds),
+            "total_accounts": len(self.accounts),
+            "total_transactions": len(self.tx_hashes),
+            "total_hops": len(self.hops),
+            "total_crawl_states": len(states),
+            "supernodes": sum(row["is_supernode"] for row in states),
+            "pending_crawls": pending_crawls,
+            "pending_expands": pending_expands,
+            "per_hop": per_hop,
+            "finished_seeds": finished_seeds,
+            "is_complete": bool(states)
+            and pending_crawls == 0
+            and pending_expands == 0,
+        }
