@@ -125,3 +125,77 @@ def test_write_snapshot_replace_failure_preserves_old_file(tmp_path, monkeypatch
             ["address", "created_at"],
             ["T-new", ""],
         ]
+
+
+def test_iter_rows_missing_file_is_empty(tmp_path):
+    assert list(bare_store()._iter_rows(tmp_path / "missing.csv")) == []
+
+
+def test_iter_rows_streams_multiline_and_complete_record_without_final_newline(tmp_path):
+    path = tmp_path / "accounts.csv"
+    path.write_bytes(
+        b'address,created_at,source\r\nT1,now,"line one\r\nline two"\r\nT2,later,complete'
+    )
+    store = bare_store()
+
+    rows = list(store._iter_rows(path))
+
+    assert rows == [
+        {"address": "T1", "created_at": "now", "source": "line one\r\nline two"},
+        {"address": "T2", "created_at": "later", "source": "complete"},
+    ]
+    assert store._current_row_offset == path.read_bytes().index(b"T2,later")
+
+
+@pytest.mark.parametrize("tail", [b'T2,later,"unterminated', b"T2,later"])
+def test_iter_rows_skips_and_removes_torn_final_record_before_append(tmp_path, tail):
+    path = tmp_path / "accounts.csv"
+    complete = b"address,created_at,source\r\nT1,now,ok\r\n"
+    path.write_bytes(complete + tail)
+    store = bare_store()
+
+    assert list(store._iter_rows(path)) == [
+        {"address": "T1", "created_at": "now", "source": "ok"}
+    ]
+    assert path.read_bytes() == complete
+
+    store._append_rows(
+        path,
+        ["address", "created_at", "source"],
+        [{"address": "T3", "created_at": "after", "source": "repair"}],
+    )
+    assert list(store._iter_rows(path))[-1]["address"] == "T3"
+
+
+def test_iter_rows_does_not_hide_complete_malformed_record(tmp_path):
+    path = tmp_path / "accounts.csv"
+    path.write_bytes(b"address,created_at\r\nT1\r\n")
+
+    with pytest.raises(csv.Error, match="expected 2"):
+        list(bare_store()._iter_rows(path))
+
+
+def test_append_after_complete_record_without_newline_keeps_both_records(tmp_path):
+    path = tmp_path / "accounts.csv"
+    path.write_bytes(b"address,created_at\r\nT1,before")
+    store = bare_store()
+    assert [row["address"] for row in store._iter_rows(path)] == ["T1"]
+
+    store._append_rows(
+        path,
+        ["address", "created_at"],
+        [{"address": "T2", "created_at": "after"}],
+    )
+
+    assert [row["address"] for row in store._iter_rows(path)] == ["T1", "T2"]
+
+
+def test_iter_rows_preserves_and_rejects_extra_column_at_eof(tmp_path):
+    path = tmp_path / "accounts.csv"
+    malformed = b"address,created_at\r\nT1,now,extra"
+    path.write_bytes(malformed)
+
+    with pytest.raises(csv.Error, match="expected 2"):
+        list(bare_store()._iter_rows(path))
+
+    assert path.read_bytes() == malformed
