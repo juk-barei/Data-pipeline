@@ -54,3 +54,22 @@ class CSVStore:
         self._appended_since_compact = (
             getattr(self, "_appended_since_compact", 0) + len(pending)
         )
+
+    def _write_snapshot(
+        self,
+        path: str | Path,
+        header: Sequence[str],
+        rows: Iterable[Mapping[str, Any]],
+    ) -> None:
+        """Atomically replace a CSV with a complete, fsynced snapshot."""
+
+        csv_path = Path(path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(f"{csv_path}.tmp")
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(list(header))
+            writer.writerows(self._row_to_list(row, header) for row in rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, csv_path)
