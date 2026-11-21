@@ -475,3 +475,80 @@ def test_append_crawl_state_rows_rejects_string_booleans(tmp_path):
         store._append_crawl_state_rows(["T1"])
 
     assert list(store._iter_rows(store.crawl_state_path)) == []
+
+
+def test_insert_seeds_creates_dependencies_and_is_byte_idempotent(tmp_path):
+    store = CSVStore(str(tmp_path))
+    address = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    seed = {
+        "wallet_address": address,
+        "transaction_id": "origin-tx",
+        "source_name": "fixture",
+        "label": 0,
+        "created_at": "2026-01-02T03:04:05+00:00",
+    }
+
+    store.insert_seeds([seed])
+    sizes = {name: path.stat().st_size for name, path in store.paths.items()}
+    store.insert_seeds([seed])
+
+    assert {name: path.stat().st_size for name, path in store.paths.items()} == sizes
+    assert store.seeds[address]["source_name"] == "fixture"
+    assert store.accounts[address]["address"] == address
+    assert store.accounts[address]["created_date"] == "2026-01-02"
+    assert store.crawl_state[address]["seed_address"] == address
+    assert store.crawl_state[address]["hop_level"] == 0
+    assert store.crawl_state[address]["synced"] is False
+
+
+def test_insert_seeds_repairs_missing_dependencies_without_duplicate_seed(tmp_path):
+    store = CSVStore(str(tmp_path))
+    address = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    existing = {
+        "wallet_address": address, "hex_address": "", "transaction_id": "",
+        "source_name": "existing", "label": "0", "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    store._append_rows(store.seed_wallets_path, store.headers["seed_wallets.csv"], [existing])
+    store.seeds[address] = existing
+
+    store.insert_seeds([existing])
+
+    assert len(list(store._iter_rows(store.seed_wallets_path))) == 1
+    assert address in store.accounts
+    assert address in store.crawl_state
+    assert len(list(store._iter_rows(store.accounts_path))) == 1
+    assert len(list(store._iter_rows(store.crawl_state_path))) == 1
+
+
+def test_insert_seeds_retries_after_dependency_write_failure(tmp_path, monkeypatch):
+    store = CSVStore(str(tmp_path))
+    address = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    seed = {
+        "wallet_address": address,
+        "label": 0,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    real_append_state = store._append_crawl_state_rows
+    attempts = 0
+
+    def fail_once(addresses):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("synthetic crawl-state write failure")
+        real_append_state(addresses)
+
+    monkeypatch.setattr(store, "_append_crawl_state_rows", fail_once)
+    with pytest.raises(OSError, match="synthetic crawl-state write failure"):
+        store.insert_seeds([seed])
+
+    assert address not in store.accounts
+    assert address not in store.crawl_state
+    assert address not in store.seeds
+    store.insert_seeds([seed])
+
+    reopened = CSVStore(str(tmp_path))
+    assert set(reopened.seeds) == {address}
+    assert set(reopened.accounts) == {address}
+    assert set(reopened.crawl_state) == {address}
+    assert reopened.crawl_state[address]["hop_level"] == 0

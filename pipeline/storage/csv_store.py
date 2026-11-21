@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from pipeline.storage.schema import build_headers
+from pipeline.utils.address import normalize_address, to_hex
+from pipeline.utils.timeutils import now_iso
 
 
 logger = logging.getLogger(__name__)
@@ -333,3 +335,65 @@ class CSVStore:
             self.headers["pipeline_crawl_state.csv"],
             rows,
         )
+
+    def insert_seeds(self, seeds: Sequence[Mapping[str, Any]]) -> None:
+        """Durably register canonical genesis seeds and repair missing dependencies."""
+
+        for supplied in seeds:
+            address = normalize_address(supplied.get("wallet_address", ""))
+            if not address:
+                raise ValueError("seed wallet_address must be a valid TRON address")
+            label = str(supplied.get("label", "0"))
+            if label != "0":
+                raise ValueError("genesis seeds must have label 0")
+
+            timestamp = str(supplied.get("created_at") or now_iso())
+            added_account = address not in self.accounts
+            added_state = address not in self.crawl_state
+            if added_account:
+                self.accounts[address] = {
+                    "address": address,
+                    "hex_address": to_hex(address),
+                    "first_seen_timestamp": "",
+                    "last_seen_timestamp": "",
+                    "created_date": timestamp[:10],
+                    "created_at": timestamp,
+                }
+            if added_state:
+                self.crawl_state[address] = {
+                    "address": address,
+                    "seed_address": address,
+                    "hop_level": 0,
+                    "synced": False,
+                    "expanded": False,
+                    "is_supernode": False,
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                }
+
+            try:
+                if added_account:
+                    self._append_account_rows([address])
+                if added_state:
+                    self._append_crawl_state_rows([address])
+                if address not in self.seeds:
+                    row = {
+                        "wallet_address": address,
+                        "hex_address": to_hex(address),
+                        "transaction_id": supplied.get("transaction_id", ""),
+                        "source_name": supplied.get("source_name", ""),
+                        "label": "0",
+                        "created_at": timestamp,
+                    }
+                    self._append_rows(
+                        self.seed_wallets_path,
+                        self.headers["seed_wallets.csv"],
+                        [row],
+                    )
+                    self.seeds[address] = row
+            except Exception:
+                if added_account:
+                    self.accounts.pop(address, None)
+                if added_state:
+                    self.crawl_state.pop(address, None)
+                raise
