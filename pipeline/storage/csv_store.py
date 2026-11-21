@@ -220,3 +220,27 @@ class CSVStore:
             if key not in self.hop_keys:
                 self.hop_keys.add(key)
                 self.hops.append(row)
+
+    def _load_crawl_state(self) -> None:
+        """Load typed crawl state with latest append winning per address."""
+
+        self.crawl_state: dict[str, dict[str, Any]] = {}
+        for source_row in self._iter_rows(self.crawl_state_path):
+            address = source_row.get("address", "")
+            if not address:
+                raise ValueError("crawl-state address is required")
+            try:
+                hop_level = int(source_row.get("hop_level", ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("crawl-state hop_level must be an integer") from exc
+            if hop_level < 0:
+                raise ValueError("crawl-state hop_level must be non-negative")
+
+            row: dict[str, Any] = dict(source_row)
+            row["hop_level"] = hop_level
+            for field in ("synced", "expanded", "is_supernode"):
+                encoded = source_row.get(field, "").strip().upper()
+                if encoded not in {"TRUE", "FALSE"}:
+                    raise ValueError(f"crawl-state {field} must be TRUE or FALSE")
+                row[field] = encoded == "TRUE"
+            self.crawl_state[address] = row

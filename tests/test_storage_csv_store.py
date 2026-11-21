@@ -325,3 +325,43 @@ def test_load_hops_rejects_invalid_numeric_state(tmp_path):
 
     with pytest.raises(ValueError, match="must be integers"):
         store._load_hops()
+
+
+def test_load_crawl_state_is_last_wins_with_typed_values(tmp_path):
+    path = tmp_path / "pipeline_crawl_state.csv"
+    store = bare_store()
+    store.crawl_state_path = path
+    header = ["address", "seed_address", "hop_level", "synced", "expanded", "is_supernode", "updated_at"]
+    store._write_snapshot(
+        path,
+        header,
+        [
+            {"address": "T1", "hop_level": "1", "synced": "FALSE", "expanded": "FALSE", "is_supernode": "FALSE", "updated_at": "old"},
+            {"address": "T2", "hop_level": "0", "synced": "true", "expanded": "false", "is_supernode": "false"},
+            {"address": "T1", "hop_level": "2", "synced": "TRUE", "expanded": "FALSE", "is_supernode": "TRUE", "updated_at": "latest"},
+        ],
+    )
+
+    store._load_crawl_state()
+
+    assert store.crawl_state["T1"] == {
+        "address": "T1", "seed_address": "", "hop_level": 2,
+        "synced": True, "expanded": False, "is_supernode": True, "updated_at": "latest",
+    }
+    assert store.crawl_state["T2"]["synced"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [("synced", "yes", "synced"), ("hop_level", "1.5", "hop_level")],
+)
+def test_load_crawl_state_rejects_ambiguous_values(tmp_path, field, value, message):
+    path = tmp_path / "pipeline_crawl_state.csv"
+    store = bare_store()
+    store.crawl_state_path = path
+    row = {"address": "T1", "hop_level": "0", "synced": "FALSE", "expanded": "FALSE", "is_supernode": "FALSE"}
+    row[field] = value
+    store._write_snapshot(path, list(row), [row])
+
+    with pytest.raises(ValueError, match=message):
+        store._load_crawl_state()
