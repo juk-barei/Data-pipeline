@@ -3,6 +3,7 @@ import csv
 import pytest
 
 from pipeline.storage.csv_store import CSVStore
+from pipeline.storage.schema import build_headers
 
 
 def bare_store():
@@ -388,3 +389,40 @@ def test_load_orchestrates_dependency_order_and_logs_counts(monkeypatch, caplog)
 
     assert calls == ["seeds", "accounts", "transactions", "hops", "crawl_state"]
     assert "seeds=1 accounts=1 transactions=1 hops=1 crawl_state=1" in caplog.text
+
+
+def test_constructor_creates_canonical_files_and_reopen_loads_all_state(tmp_path):
+    store = CSVStore(str(tmp_path / "data"))
+    assert store.csv_dir.is_absolute()
+    assert set(store.paths) == set(build_headers())
+    for name, header in build_headers().items():
+        with store.paths[name].open(encoding="utf-8", newline="") as handle:
+            assert next(csv.reader(handle)) == header
+
+    store._append_rows(store.seed_wallets_path, store.headers["seed_wallets.csv"], [
+        {"wallet_address": "S1", "label": "0", "created_at": "now"}
+    ])
+    store._append_rows(store.accounts_path, store.headers["accounts.csv"], [
+        {"address": "T1", "created_at": "now"}
+    ])
+    store._append_rows(store.transactions_path, store.headers["transactions.csv"], [
+        {"tx_hash": "h1", "from_address": "T1", "to_address": "T2"}
+    ])
+    store._append_rows(store.wallet_hops_path, store.headers["wallet_hops.csv"], [
+        {"hop_id": "7", "wallet_address": "T1", "seed_address": "S1", "hop_level": "1"}
+    ])
+    store._append_rows(store.crawl_state_path, store.headers["pipeline_crawl_state.csv"], [
+        {"address": "T1", "seed_address": "S1", "hop_level": "1", "synced": "TRUE", "expanded": "FALSE", "is_supernode": "FALSE"}
+    ])
+
+    reopened = CSVStore(str(store.csv_dir))
+
+    assert set(reopened.seeds) == {"S1"}
+    assert set(reopened.accounts) == {"T1"}
+    assert reopened.tx_hashes == {"h1"}
+    assert reopened.max_hop_id == 7
+    assert reopened.crawl_state["T1"]["synced"] is True
+    reopened.accounts["STALE"] = {}
+    reopened.load()
+    assert "STALE" not in reopened.accounts
+    assert reopened._appended_since_compact == 0

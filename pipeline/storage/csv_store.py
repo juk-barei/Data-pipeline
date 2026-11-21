@@ -9,12 +9,42 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from pipeline.storage.schema import build_headers
+
 
 logger = logging.getLogger(__name__)
 
 
 class CSVStore:
     """Store pipeline state in five append-only CSV files."""
+
+    def __init__(self, csv_dir: str, *, retain_all_seeds: bool = False) -> None:
+        """Initialize canonical files and load their current append-log state."""
+
+        self.csv_dir = Path(csv_dir).expanduser().resolve()
+        self.headers = build_headers()
+        self.paths = {name: self.csv_dir / name for name in self.headers}
+        self.seed_wallets_path = self.paths["seed_wallets.csv"]
+        self.accounts_path = self.paths["accounts.csv"]
+        self.transactions_path = self.paths["transactions.csv"]
+        self.wallet_hops_path = self.paths["wallet_hops.csv"]
+        self.crawl_state_path = self.paths["pipeline_crawl_state.csv"]
+        self.retain_all_seeds = retain_all_seeds
+        self._appended_since_compact = 0
+
+        self.seeds: dict[str, dict[str, str]] = {}
+        self.accounts: dict[str, dict[str, str]] = {}
+        self.tx_hashes: set[str] = set()
+        self.wallet_tx_hashes: dict[str, set[str]] = {}
+        self.tx_offsets: dict[str, int] = {}
+        self.hops: list[dict[str, str]] = []
+        self.hop_keys: set[tuple[str, str, int]] = set()
+        self.max_hop_id = 0
+        self.crawl_state: dict[str, dict[str, Any]] = {}
+
+        for name, header in self.headers.items():
+            self._init_file(self.paths[name], header)
+        self.load()
 
     def _init_file(self, path: str | Path, header: Sequence[str]) -> None:
         """Create a missing or empty CSV with its header without truncating data."""
