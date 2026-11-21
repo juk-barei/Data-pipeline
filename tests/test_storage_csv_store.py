@@ -748,3 +748,98 @@ def test_get_wallet_transactions_detects_stale_offset(tmp_path):
 
     with pytest.raises(RuntimeError, match="stale transaction offset"):
         store.get_wallet_transactions("T1")
+
+
+def test_add_expansion_results_persists_edges_frontier_then_parent_completion(tmp_path):
+    store = CSVStore(str(tmp_path))
+    parent = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    child = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    store.insert_seeds([{"wallet_address": parent, "label": 0}])
+    store.upsert_crawled_data([], [], [parent], [])
+    account = {"address": child, "first_seen_timestamp": "first"}
+    crawl = {"address": child, "seed_address": parent, "hop_level": 2}
+    hop = {
+        "wallet_address": child, "seed_address": parent, "parent_address": parent,
+        "via_tx_hash": "h1", "hop_level": 2, "direction": "out",
+    }
+
+    store.add_expansion_results([account], [crawl], [hop, dict(hop)], [parent])
+    store.add_expansion_results([], [{**crawl, "hop_level": 3}], [hop], [parent])
+
+    assert store.crawl_state[parent]["expanded"] is True
+    assert store.crawl_state[child]["hop_level"] == 2
+    assert len(store.hops) == 1
+    assert store.hops[0]["hop_id"] == 1
+    reopened = CSVStore(str(tmp_path))
+    assert reopened.crawl_state[parent]["expanded"] is True
+    assert reopened.crawl_state[child]["hop_level"] == 2
+    assert reopened.hop_keys == {(child, parent, 2)}
+
+
+def test_add_expansion_failure_does_not_mark_parent_expanded_and_retries(tmp_path, monkeypatch):
+    store = CSVStore(str(tmp_path))
+    parent = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    child = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    store.insert_seeds([{"wallet_address": parent, "label": 0}])
+    real_append = store._append_rows
+    failed = False
+
+    def fail_hops_once(path, header, rows):
+        nonlocal failed
+        if path == store.wallet_hops_path and not failed:
+            failed = True
+            raise OSError("synthetic hop write failure")
+        real_append(path, header, rows)
+
+    monkeypatch.setattr(store, "_append_rows", fail_hops_once)
+    account = {"address": child}
+    crawl = {"address": child, "seed_address": parent, "hop_level": 1}
+    hop = {"wallet_address": child, "seed_address": parent, "hop_level": 1}
+    with pytest.raises(OSError, match="synthetic hop write failure"):
+        store.add_expansion_results([account], [crawl], [hop], [parent])
+
+    assert store.crawl_state[parent]["expanded"] is False
+    assert child not in store.crawl_state
+    assert store.hops == []
+    store.add_expansion_results([account], [crawl], [hop], [parent])
+    assert store.crawl_state[parent]["expanded"] is True
+    assert child in store.crawl_state
+
+
+@pytest.mark.parametrize("invalid_level", [-1, 1.5, "1.5", True])
+def test_add_expansion_rejects_invalid_frontier_before_any_write(tmp_path, invalid_level):
+    store = CSVStore(str(tmp_path))
+    parent = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    child = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    store.insert_seeds([{"wallet_address": parent, "label": 0}])
+    before = {name: path.read_bytes() for name, path in store.paths.items()}
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        store.add_expansion_results(
+            [{"address": child}],
+            [{"address": child, "seed_address": parent, "hop_level": invalid_level}],
+            [],
+            [parent],
+        )
+
+    assert {name: path.read_bytes() for name, path in store.paths.items()} == before
+    assert store.crawl_state[parent]["expanded"] is False
+    assert child not in store.accounts
+
+
+def test_add_expansion_requires_frontier_seed_before_any_write(tmp_path):
+    store = CSVStore(str(tmp_path))
+    parent = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    child = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    store.insert_seeds([{"wallet_address": parent, "label": 0}])
+    before = {name: path.read_bytes() for name, path in store.paths.items()}
+
+    with pytest.raises(ValueError, match="seed_address"):
+        store.add_expansion_results(
+            [{"address": child}],
+            [{"address": child, "hop_level": 1}],
+            [],
+            [parent],
+        )
+
+    assert {name: path.read_bytes() for name, path in store.paths.items()} == before

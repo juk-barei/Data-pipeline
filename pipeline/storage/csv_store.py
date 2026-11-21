@@ -568,3 +568,123 @@ class CSVStore:
                     rows.append(row)
                     break
         return rows
+
+    def add_expansion_results(
+        self,
+        new_accounts: Sequence[Mapping[str, Any]],
+        new_crawl: Sequence[Mapping[str, Any]],
+        new_hops: Sequence[Mapping[str, Any]],
+        expanded: Sequence[str],
+    ) -> None:
+        """Persist discoveries before marking their parent rows expanded."""
+
+        expanded_addresses = list(dict.fromkeys(expanded))
+        missing = [address for address in expanded_addresses if address not in self.crawl_state]
+        if missing:
+            raise ValueError(f"crawl state missing for expanded: {', '.join(missing)}")
+
+        def nonnegative_level(value: Any, context: str) -> int:
+            if type(value) is int:
+                parsed = value
+            elif (
+                isinstance(value, str)
+                and value.isascii()
+                and value.isdigit()
+                and (value == "0" or not value.startswith("0"))
+            ):
+                parsed = int(value)
+            else:
+                raise ValueError(f"{context} hop_level must be a non-negative integer")
+            if parsed < 0:
+                raise ValueError(f"{context} hop_level must be a non-negative integer")
+            return parsed
+
+        validated_hops: list[tuple[Mapping[str, Any], int]] = []
+        for supplied in new_hops:
+            wallet = str(supplied.get("wallet_address", ""))
+            seed = str(supplied.get("seed_address", ""))
+            if not wallet or not seed:
+                raise ValueError("expanded hop requires wallet and seed")
+            validated_hops.append(
+                (supplied, nonnegative_level(supplied.get("hop_level"), "expanded hop"))
+            )
+
+        validated_crawl: list[tuple[Mapping[str, Any], int]] = []
+        for supplied in new_crawl:
+            address = str(supplied.get("address", ""))
+            seed = str(supplied.get("seed_address", ""))
+            if not address or not seed:
+                raise ValueError("expanded crawl requires address and seed_address")
+            validated_crawl.append(
+                (supplied, nonnegative_level(supplied.get("hop_level"), "expanded crawl"))
+            )
+
+        try:
+            timestamp = now_iso()
+            changed_accounts: list[str] = []
+            for supplied in new_accounts:
+                address = str(supplied.get("address", ""))
+                if not address:
+                    raise ValueError("expanded account address is required")
+                merged = dict(self.accounts.get(address, {}))
+                merged.update(supplied)
+                merged.setdefault("address", address)
+                merged.setdefault("created_at", timestamp)
+                merged.setdefault("created_date", timestamp[:10])
+                self.accounts[address] = merged
+                changed_accounts.append(address)
+            self._append_account_rows(changed_accounts)
+
+            appended_hops: list[dict[str, Any]] = []
+            for supplied, hop_level in validated_hops:
+                wallet = str(supplied.get("wallet_address", ""))
+                seed = str(supplied.get("seed_address", ""))
+                key = (wallet, seed, hop_level)
+                if key in self.hop_keys:
+                    continue
+                supplied_id = supplied.get("hop_id", "")
+                hop_id = int(supplied_id) if supplied_id not in (None, "") else self.max_hop_id + 1
+                if hop_id < 0:
+                    raise ValueError("expanded hop_id must be non-negative")
+                row = dict(supplied)
+                row["hop_id"] = hop_id
+                row["hop_level"] = hop_level
+                row.setdefault("discovered_at", timestamp)
+                self.max_hop_id = max(self.max_hop_id, hop_id)
+                self.hop_keys.add(key)
+                self.hops.append(row)
+                appended_hops.append(row)
+            self._append_rows(
+                self.wallet_hops_path,
+                self.headers["wallet_hops.csv"],
+                appended_hops,
+            )
+
+            changed_crawl: list[str] = []
+            for supplied, hop_level in validated_crawl:
+                address = str(supplied.get("address", ""))
+                current = self.crawl_state.get(address)
+                if current is not None and current["hop_level"] <= hop_level:
+                    continue
+                row: dict[str, Any] = dict(supplied)
+                row["address"] = address
+                row["hop_level"] = hop_level
+                row.setdefault("synced", False)
+                row.setdefault("expanded", False)
+                row.setdefault("is_supernode", False)
+                row.setdefault("created_at", timestamp)
+                row["updated_at"] = timestamp
+                self.crawl_state[address] = row
+                changed_crawl.append(address)
+            self._append_crawl_state_rows(changed_crawl)
+
+            for address in expanded_addresses:
+                self.crawl_state[address]["expanded"] = True
+                self.crawl_state[address]["updated_at"] = timestamp
+            self._append_crawl_state_rows(expanded_addresses)
+        except Exception:
+            try:
+                self.load()
+            except Exception:
+                logger.exception("failed to reload CSV state after expansion write error")
+            raise
