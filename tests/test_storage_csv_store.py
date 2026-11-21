@@ -703,3 +703,48 @@ def test_mark_supernode_write_failure_reloads_nonphantom_state(tmp_path, monkeyp
 
     assert store.crawl_state[address]["is_supernode"] is False
     assert store.crawl_state[address]["expanded"] is False
+
+
+def test_get_wallet_transactions_seeks_offsets_and_supports_multiline_fields(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.upsert_crawled_data(
+        [],
+        [
+            {"tx_hash": "h1", "from_address": "T1", "to_address": "T2", "token_symbol": "line one\nline two", "amount": "1"},
+            {"tx_hash": "h2", "from_address": "T3", "to_address": "T1", "token_symbol": "TRX", "amount": "2"},
+            {"tx_hash": "h3", "from_address": "T9", "to_address": "T8", "amount": "3"},
+        ],
+        [],
+        [],
+    )
+    reopened = CSVStore(str(tmp_path))
+
+    rows = reopened.get_wallet_transactions("T1")
+
+    assert [row["tx_hash"] for row in rows] == ["h1", "h2"]
+    assert rows[0]["token_symbol"] == "line one\nline two"
+    assert [row["amount"] for row in rows] == ["1", "2"]
+
+
+def test_get_wallet_transactions_unknown_wallet_does_not_touch_disk(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.transactions_path.unlink()
+
+    assert store.get_wallet_transactions("UNKNOWN") == []
+
+
+def test_get_wallet_transactions_detects_stale_offset(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.upsert_crawled_data(
+        [],
+        [
+            {"tx_hash": "h1", "from_address": "T1", "to_address": "T2"},
+            {"tx_hash": "h2", "from_address": "T3", "to_address": "T4"},
+        ],
+        [],
+        [],
+    )
+    store.tx_offsets["h1"] = store.tx_offsets["h2"]
+
+    with pytest.raises(RuntimeError, match="stale transaction offset"):
+        store.get_wallet_transactions("T1")

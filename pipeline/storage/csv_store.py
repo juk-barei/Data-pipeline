@@ -527,3 +527,44 @@ class CSVStore:
             except Exception:
                 logger.exception("failed to reload CSV state after supernode write error")
             raise
+
+    def get_wallet_transactions(self, address: str) -> list[dict[str, str]]:
+        """Seek directly to indexed transactions touching an address."""
+
+        hashes = self.wallet_tx_hashes.get(address)
+        if not hashes:
+            return []
+
+        header = self.headers["transactions.csv"]
+        ordered = sorted(hashes, key=lambda tx_hash: self.tx_offsets[tx_hash])
+        rows: list[dict[str, str]] = []
+        with self.transactions_path.open("rb") as handle:
+            for expected_hash in ordered:
+                handle.seek(self.tx_offsets[expected_hash])
+                buffer = bytearray()
+                while True:
+                    physical_line = handle.readline()
+                    if not physical_line:
+                        raise csv.Error(f"incomplete indexed transaction {expected_hash}")
+                    buffer.extend(physical_line)
+                    try:
+                        records = list(
+                            csv.reader(
+                                io.StringIO(buffer.decode("utf-8"), newline=""),
+                                strict=True,
+                            )
+                        )
+                    except csv.Error as exc:
+                        if "unexpected end of data" in str(exc).lower():
+                            continue
+                        raise
+                    if len(records) != 1 or len(records[0]) != len(header):
+                        raise csv.Error(f"invalid indexed transaction {expected_hash}")
+                    row = dict(zip(header, records[0]))
+                    if row["tx_hash"] != expected_hash:
+                        raise RuntimeError(
+                            f"stale transaction offset for {expected_hash}: found {row['tx_hash']}"
+                        )
+                    rows.append(row)
+                    break
+        return rows
