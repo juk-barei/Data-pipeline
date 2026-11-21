@@ -668,3 +668,38 @@ def test_claim_expand_batch_includes_supernodes_and_hop_five_for_later_pruning(t
 def test_claim_expand_batch_rejects_invalid_sizes(tmp_path, size):
     with pytest.raises(ValueError, match="non-negative integer"):
         CSVStore(str(tmp_path)).claim_expand_batch(size)
+
+
+def test_mark_supernode_persists_flags_visible_after_reload(tmp_path):
+    store = CSVStore(str(tmp_path))
+    address = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    store.insert_seeds([{"wallet_address": address, "label": 0}])
+    before = store.crawl_state[address]["updated_at"]
+
+    store.mark_supernode(address)
+
+    assert store.crawl_state[address]["is_supernode"] is True
+    assert store.crawl_state[address]["expanded"] is True
+    assert store.crawl_state[address]["updated_at"] >= before
+    row_count = len(list(store._iter_rows(store.crawl_state_path)))
+    store.mark_supernode(address)
+    assert len(list(store._iter_rows(store.crawl_state_path))) == row_count
+    reopened = CSVStore(str(tmp_path))
+    assert reopened.crawl_state[address]["is_supernode"] is True
+    assert reopened.crawl_state[address]["expanded"] is True
+
+
+def test_mark_supernode_write_failure_reloads_nonphantom_state(tmp_path, monkeypatch):
+    store = CSVStore(str(tmp_path))
+    address = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    store.insert_seeds([{"wallet_address": address, "label": 0}])
+
+    def fail(_addresses):
+        raise OSError("synthetic state write failure")
+
+    monkeypatch.setattr(store, "_append_crawl_state_rows", fail)
+    with pytest.raises(OSError, match="synthetic state write failure"):
+        store.mark_supernode(address)
+
+    assert store.crawl_state[address]["is_supernode"] is False
+    assert store.crawl_state[address]["expanded"] is False

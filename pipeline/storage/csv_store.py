@@ -507,3 +507,23 @@ class CSVStore:
             ),
         )
         return [dict(row) for row in ordered[:n]]
+
+    def mark_supernode(self, address: str) -> None:
+        """Persist a frontier address as both supernode and expanded."""
+
+        if address not in self.crawl_state:
+            raise KeyError(f"crawl state not found for {address}")
+        state = self.crawl_state[address]
+        if state["is_supernode"] and state["expanded"]:
+            return
+        state["is_supernode"] = True
+        state["expanded"] = True
+        state["updated_at"] = now_iso()
+        try:
+            self._append_crawl_state_rows([address])
+        except Exception:
+            try:
+                self.load()
+            except Exception:
+                logger.exception("failed to reload CSV state after supernode write error")
+            raise
