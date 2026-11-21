@@ -153,3 +153,18 @@ class CSVStore:
                 handle.truncate(last_good_offset)
                 handle.flush()
                 os.fsync(handle.fileno())
+
+    def _load_seeds(self) -> None:
+        """Load last-row-wins seed state, retaining licit labels by default."""
+
+        latest: dict[str, dict[str, str]] = {}
+        for row in self._iter_rows(self.seed_wallets_path):
+            wallet = row.get("wallet_address", "")
+            if wallet:
+                latest[wallet] = row
+        if getattr(self, "retain_all_seeds", False):
+            self.seeds = latest
+        else:
+            self.seeds = {
+                wallet: row for wallet, row in latest.items() if row.get("label") == "0"
+            }

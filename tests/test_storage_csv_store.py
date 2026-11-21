@@ -199,3 +199,45 @@ def test_iter_rows_preserves_and_rejects_extra_column_at_eof(tmp_path):
         list(bare_store()._iter_rows(path))
 
     assert path.read_bytes() == malformed
+
+
+def test_load_seeds_is_last_row_wins_then_filters_latest_label(tmp_path):
+    path = tmp_path / "seed_wallets.csv"
+    header = ["wallet_address", "hex_address", "transaction_id", "source_name", "label", "created_at"]
+    store = bare_store()
+    store.seed_wallets_path = path
+    store._write_snapshot(
+        path,
+        header,
+        [
+            {"wallet_address": "T1", "label": "0", "source_name": "old"},
+            {"wallet_address": "T2", "label": "1"},
+            {"wallet_address": "T1", "label": "1", "source_name": "latest"},
+            {"wallet_address": "T3", "label": "0"},
+        ],
+    )
+
+    store._load_seeds()
+
+    assert set(store.seeds) == {"T3"}
+
+
+def test_load_seeds_can_retain_all_latest_rows(tmp_path):
+    path = tmp_path / "seed_wallets.csv"
+    store = bare_store()
+    store.seed_wallets_path = path
+    store.retain_all_seeds = True
+    store._write_snapshot(
+        path,
+        ["wallet_address", "label"],
+        [
+            {"wallet_address": "T1", "label": "0"},
+            {"wallet_address": "T1", "label": "1"},
+            {"wallet_address": "T2", "label": "0"},
+        ],
+    )
+
+    store._load_seeds()
+
+    assert store.seeds["T1"]["label"] == "1"
+    assert set(store.seeds) == {"T1", "T2"}
