@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import os
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
+
+
+logger = logging.getLogger(__name__)
 
 
 class CSVStore:
@@ -244,3 +248,20 @@ class CSVStore:
                     raise ValueError(f"crawl-state {field} must be TRUE or FALSE")
                 row[field] = encoded == "TRUE"
             self.crawl_state[address] = row
+
+    def load(self) -> None:
+        """Rebuild all in-memory state from CSVs in dependency order."""
+
+        self._load_seeds()
+        self._load_accounts()
+        self._load_transactions()
+        self._load_hops()
+        self._load_crawl_state()
+        logger.info(
+            "loaded CSV state: seeds=%d accounts=%d transactions=%d hops=%d crawl_state=%d",
+            len(self.seeds),
+            len(self.accounts),
+            len(self.tx_hashes),
+            len(self.hops),
+            len(self.crawl_state),
+        )

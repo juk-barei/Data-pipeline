@@ -365,3 +365,26 @@ def test_load_crawl_state_rejects_ambiguous_values(tmp_path, field, value, messa
 
     with pytest.raises(ValueError, match=message):
         store._load_crawl_state()
+
+
+def test_load_orchestrates_dependency_order_and_logs_counts(monkeypatch, caplog):
+    store = bare_store()
+    calls = []
+
+    def loader(name, attribute, value):
+        def run():
+            calls.append(name)
+            setattr(store, attribute, value)
+        return run
+
+    monkeypatch.setattr(store, "_load_seeds", loader("seeds", "seeds", {"S": {}}))
+    monkeypatch.setattr(store, "_load_accounts", loader("accounts", "accounts", {"A": {}}))
+    monkeypatch.setattr(store, "_load_transactions", loader("transactions", "tx_hashes", {"H"}))
+    monkeypatch.setattr(store, "_load_hops", loader("hops", "hops", [{}]))
+    monkeypatch.setattr(store, "_load_crawl_state", loader("crawl_state", "crawl_state", {"A": {}}))
+    caplog.set_level("INFO", logger="pipeline.storage.csv_store")
+
+    store.load()
+
+    assert calls == ["seeds", "accounts", "transactions", "hops", "crawl_state"]
+    assert "seeds=1 accounts=1 transactions=1 hops=1 crawl_state=1" in caplog.text
