@@ -4,13 +4,51 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from pipeline.storage.schema import build_headers
+from pipeline.utils.address import normalize_address, to_hex
+from pipeline.utils.timeutils import now_iso
+
+
+logger = logging.getLogger(__name__)
+
 
 class CSVStore:
     """Store pipeline state in five append-only CSV files."""
+
+    def __init__(self, csv_dir: str, *, retain_all_seeds: bool = False) -> None:
+        """Initialize canonical files and load their current append-log state."""
+
+        self.csv_dir = Path(csv_dir).expanduser().resolve()
+        self.headers = build_headers()
+        self.paths = {name: self.csv_dir / name for name in self.headers}
+        self.seed_wallets_path = self.paths["seed_wallets.csv"]
+        self.accounts_path = self.paths["accounts.csv"]
+        self.transactions_path = self.paths["transactions.csv"]
+        self.wallet_hops_path = self.paths["wallet_hops.csv"]
+        self.crawl_state_path = self.paths["pipeline_crawl_state.csv"]
+        self._reset_marker_path = self.csv_dir / ".reset-to-seeds.json"
+        self.retain_all_seeds = retain_all_seeds
+        self._appended_since_compact = 0
+
+        self.seeds: dict[str, dict[str, str]] = {}
+        self.accounts: dict[str, dict[str, str]] = {}
+        self.tx_hashes: set[str] = set()
+        self.wallet_tx_hashes: dict[str, set[str]] = {}
+        self.tx_offsets: dict[str, int] = {}
+        self.hops: list[dict[str, str]] = []
+        self.hop_keys: set[tuple[str, str, int]] = set()
+        self.max_hop_id = 0
+        self.crawl_state: dict[str, dict[str, Any]] = {}
+
+        for name, header in self.headers.items():
+            self._init_file(self.paths[name], header)
+        self.load()
 
     def _init_file(self, path: str | Path, header: Sequence[str]) -> None:
         """Create a missing or empty CSV with its header without truncating data."""
@@ -168,3 +206,629 @@ class CSVStore:
             self.seeds = {
                 wallet: row for wallet, row in latest.items() if row.get("label") == "0"
             }
+
+    def _load_accounts(self) -> None:
+        """Load account rows keyed by address with latest append winning."""
+
+        self.accounts = {}
+        for row in self._iter_rows(self.accounts_path):
+            address = row.get("address", "")
+            if address:
+                self.accounts[address] = row
+
+    def _load_transactions(self) -> None:
+        """Build compact hash, address, and byte-offset transaction indexes."""
+
+        self.tx_hashes: set[str] = set()
+        self.wallet_tx_hashes: dict[str, set[str]] = {}
+        self.tx_offsets: dict[str, int] = {}
+        for row in self._iter_rows(self.transactions_path):
+            tx_hash = row.get("tx_hash", "")
+            if not tx_hash or tx_hash in self.tx_hashes:
+                continue
+
+            self.tx_hashes.add(tx_hash)
+            self.tx_offsets[tx_hash] = self._current_row_offset
+            for address in {row.get("from_address", ""), row.get("to_address", "")}:
+                if address:
+                    self.wallet_tx_hashes.setdefault(address, set()).add(tx_hash)
+
+    def _load_hops(self) -> None:
+        """Load unique hop edges and the greatest observed hop identifier."""
+
+        self.hops: list[dict[str, str]] = []
+        self.hop_keys: set[tuple[str, str, int]] = set()
+        self.max_hop_id = 0
+        for row in self._iter_rows(self.wallet_hops_path):
+            try:
+                hop_id = int(row.get("hop_id", ""))
+                hop_level = int(row.get("hop_level", ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("hop_id and hop_level must be integers") from exc
+            if hop_id < 0 or hop_level < 0:
+                raise ValueError("hop_id and hop_level must be non-negative")
+
+            wallet = row.get("wallet_address", "")
+            seed = row.get("seed_address", "")
+            if not wallet or not seed:
+                raise ValueError("wallet_address and seed_address are required")
+
+            self.max_hop_id = max(self.max_hop_id, hop_id)
+            key = (wallet, seed, hop_level)
+            if key not in self.hop_keys:
+                self.hop_keys.add(key)
+                self.hops.append(row)
+
+    def _load_crawl_state(self) -> None:
+        """Load typed crawl state with latest append winning per address."""
+
+        self.crawl_state: dict[str, dict[str, Any]] = {}
+        for source_row in self._iter_rows(self.crawl_state_path):
+            address = source_row.get("address", "")
+            if not address:
+                raise ValueError("crawl-state address is required")
+            try:
+                hop_level = int(source_row.get("hop_level", ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("crawl-state hop_level must be an integer") from exc
+            if hop_level < 0:
+                raise ValueError("crawl-state hop_level must be non-negative")
+
+            row: dict[str, Any] = dict(source_row)
+            row["hop_level"] = hop_level
+            for field in ("synced", "expanded", "is_supernode"):
+                encoded = source_row.get(field, "").strip().upper()
+                if encoded not in {"TRUE", "FALSE"}:
+                    raise ValueError(f"crawl-state {field} must be TRUE or FALSE")
+                row[field] = encoded == "TRUE"
+            self.crawl_state[address] = row
+
+    def load(self) -> None:
+        """Rebuild all in-memory state from CSVs in dependency order."""
+
+        reset_marker = getattr(self, "_reset_marker_path", None)
+        if reset_marker is not None and reset_marker.is_file():
+            with reset_marker.open(encoding="utf-8") as handle:
+                reset = json.load(handle)
+            self._write_snapshot(
+                self.accounts_path,
+                self.headers["accounts.csv"],
+                reset["accounts"],
+            )
+            self._write_snapshot(
+                self.transactions_path,
+                self.headers["transactions.csv"],
+                [],
+            )
+            self._write_snapshot(
+                self.wallet_hops_path,
+                self.headers["wallet_hops.csv"],
+                [],
+            )
+            self._write_snapshot(
+                self.crawl_state_path,
+                self.headers["pipeline_crawl_state.csv"],
+                reset["crawl_state"],
+            )
+            reset_marker.unlink()
+
+        self._load_seeds()
+        self._load_accounts()
+        self._load_transactions()
+        self._load_hops()
+        self._load_crawl_state()
+        logger.info(
+            "loaded CSV state: seeds=%d accounts=%d transactions=%d hops=%d crawl_state=%d",
+            len(self.seeds),
+            len(self.accounts),
+            len(self.tx_hashes),
+            len(self.hops),
+            len(self.crawl_state),
+        )
+
+    def _append_account_rows(self, addresses: Sequence[str]) -> None:
+        """Append current rows for known addresses once per requested address."""
+
+        seen: set[str] = set()
+        rows: list[Mapping[str, Any]] = []
+        for address in addresses:
+            if address not in seen and address in self.accounts:
+                seen.add(address)
+                rows.append(self.accounts[address])
+        self._append_rows(
+            self.accounts_path,
+            self.headers["accounts.csv"],
+            rows,
+        )
+
+    def _append_crawl_state_rows(self, addresses: Sequence[str]) -> None:
+        """Append known typed crawl states with canonical boolean encoding."""
+
+        seen: set[str] = set()
+        rows: list[dict[str, Any]] = []
+        for address in addresses:
+            if address in seen or address not in self.crawl_state:
+                continue
+            seen.add(address)
+            source = self.crawl_state[address]
+            row = dict(source)
+            for field in ("synced", "expanded", "is_supernode"):
+                value = source.get(field)
+                if type(value) is not bool:
+                    raise ValueError(f"crawl-state {field} must be bool")
+                row[field] = "TRUE" if value else "FALSE"
+            rows.append(row)
+        self._append_rows(
+            self.crawl_state_path,
+            self.headers["pipeline_crawl_state.csv"],
+            rows,
+        )
+
+    def insert_seeds(self, seeds: Sequence[Mapping[str, Any]]) -> None:
+        """Durably register canonical genesis seeds and repair missing dependencies."""
+
+        for supplied in seeds:
+            address = normalize_address(supplied.get("wallet_address", ""))
+            if not address:
+                raise ValueError("seed wallet_address must be a valid TRON address")
+            label = str(supplied.get("label", "0"))
+            if label != "0":
+                raise ValueError("genesis seeds must have label 0")
+
+            timestamp = str(supplied.get("created_at") or now_iso())
+            added_account = address not in self.accounts
+            added_state = address not in self.crawl_state
+            if added_account:
+                self.accounts[address] = {
+                    "address": address,
+                    "hex_address": to_hex(address),
+                    "first_seen_timestamp": "",
+                    "last_seen_timestamp": "",
+                    "created_date": timestamp[:10],
+                    "created_at": timestamp,
+                }
+            if added_state:
+                self.crawl_state[address] = {
+                    "address": address,
+                    "seed_address": address,
+                    "hop_level": 0,
+                    "synced": False,
+                    "expanded": False,
+                    "is_supernode": False,
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                }
+
+            try:
+                if added_account:
+                    self._append_account_rows([address])
+                if added_state:
+                    self._append_crawl_state_rows([address])
+                if address not in self.seeds:
+                    row = {
+                        "wallet_address": address,
+                        "hex_address": to_hex(address),
+                        "transaction_id": supplied.get("transaction_id", ""),
+                        "source_name": supplied.get("source_name", ""),
+                        "label": "0",
+                        "created_at": timestamp,
+                    }
+                    self._append_rows(
+                        self.seed_wallets_path,
+                        self.headers["seed_wallets.csv"],
+                        [row],
+                    )
+                    self.seeds[address] = row
+            except Exception:
+                if added_account:
+                    self.accounts.pop(address, None)
+                if added_state:
+                    self.crawl_state.pop(address, None)
+                raise
+
+    def upsert_crawled_data(
+        self,
+        accounts: Sequence[Mapping[str, Any]],
+        txs: Sequence[Mapping[str, Any]],
+        synced: Sequence[str],
+        supernodes: Sequence[str],
+    ) -> None:
+        """Durably apply a crawl batch before marking its frontier complete."""
+
+        synced_addresses = list(dict.fromkeys(synced))
+        supernode_set = set(supernodes)
+        state_addresses = list(dict.fromkeys([*synced_addresses, *supernodes]))
+        missing_states = [address for address in state_addresses if address not in self.crawl_state]
+        if missing_states:
+            raise ValueError(f"crawl state missing for: {', '.join(missing_states)}")
+
+        try:
+            changed_accounts: list[str] = []
+            for supplied in accounts:
+                address = str(supplied.get("address", ""))
+                if not address:
+                    raise ValueError("account address is required")
+                timestamp = now_iso()
+                merged = dict(self.accounts.get(address, {}))
+                merged.update(supplied)
+                merged.setdefault("address", address)
+                merged.setdefault("created_at", timestamp)
+                merged.setdefault("created_date", timestamp[:10])
+                self.accounts[address] = merged
+                changed_accounts.append(address)
+            self._append_account_rows(changed_accounts)
+
+            for supplied in txs:
+                tx_hash = str(supplied.get("tx_hash", ""))
+                if not tx_hash:
+                    raise ValueError("transaction tx_hash is required")
+                if tx_hash in self.tx_hashes:
+                    continue
+
+                old_size = self.transactions_path.stat().st_size
+                separator_size = 0
+                if old_size:
+                    with self.transactions_path.open("rb") as existing:
+                        existing.seek(-1, os.SEEK_END)
+                        if existing.read(1) not in (b"\n", b"\r"):
+                            separator_size = 2
+                row = dict(supplied)
+                self._append_rows(
+                    self.transactions_path,
+                    self.headers["transactions.csv"],
+                    [row],
+                )
+                self.tx_hashes.add(tx_hash)
+                self.tx_offsets[tx_hash] = old_size + separator_size
+                for address in {row.get("from_address", ""), row.get("to_address", "")}:
+                    if address:
+                        self.wallet_tx_hashes.setdefault(str(address), set()).add(tx_hash)
+
+            timestamp = now_iso()
+            for address in state_addresses:
+                state = self.crawl_state[address]
+                if address in synced_addresses:
+                    state["synced"] = True
+                if address in supernode_set:
+                    state["is_supernode"] = True
+                state["updated_at"] = timestamp
+            self._append_crawl_state_rows(state_addresses)
+        except Exception:
+            try:
+                self.load()
+            except Exception:
+                logger.exception("failed to reload CSV state after crawl-batch error")
+            raise
+
+    def claim_crawl_batch(self, n: int) -> list[dict[str, Any]]:
+        """Return immutable-by-copy frontier work ordered by breadth-first priority."""
+
+        if type(n) is not int or n < 0:
+            raise ValueError("batch size must be a non-negative integer")
+        pending = (row for row in self.crawl_state.values() if not row["synced"])
+        ordered = sorted(
+            pending,
+            key=lambda row: (
+                row["hop_level"],
+                str(row.get("created_at", "")),
+                str(row.get("address", "")),
+            ),
+        )
+        return [dict(row) for row in ordered[:n]]
+
+    def claim_expand_batch(self, n: int) -> list[dict[str, Any]]:
+        """Return synced, unexpanded rows ordered by breadth-first priority."""
+
+        if type(n) is not int or n < 0:
+            raise ValueError("batch size must be a non-negative integer")
+        pending = (
+            row
+            for row in self.crawl_state.values()
+            if row["synced"] and not row["expanded"]
+        )
+        ordered = sorted(
+            pending,
+            key=lambda row: (
+                row["hop_level"],
+                str(row.get("created_at", "")),
+                str(row.get("address", "")),
+            ),
+        )
+        return [dict(row) for row in ordered[:n]]
+
+    def mark_supernode(self, address: str) -> None:
+        """Persist a frontier address as both supernode and expanded."""
+
+        if address not in self.crawl_state:
+            raise KeyError(f"crawl state not found for {address}")
+        state = self.crawl_state[address]
+        if state["is_supernode"] and state["expanded"]:
+            return
+        state["is_supernode"] = True
+        state["expanded"] = True
+        state["updated_at"] = now_iso()
+        try:
+            self._append_crawl_state_rows([address])
+        except Exception:
+            try:
+                self.load()
+            except Exception:
+                logger.exception("failed to reload CSV state after supernode write error")
+            raise
+
+    def get_wallet_transactions(self, address: str) -> list[dict[str, str]]:
+        """Seek directly to indexed transactions touching an address."""
+
+        hashes = self.wallet_tx_hashes.get(address)
+        if not hashes:
+            return []
+
+        header = self.headers["transactions.csv"]
+        ordered = sorted(hashes, key=lambda tx_hash: self.tx_offsets[tx_hash])
+        rows: list[dict[str, str]] = []
+        with self.transactions_path.open("rb") as handle:
+            for expected_hash in ordered:
+                handle.seek(self.tx_offsets[expected_hash])
+                buffer = bytearray()
+                while True:
+                    physical_line = handle.readline()
+                    if not physical_line:
+                        raise csv.Error(f"incomplete indexed transaction {expected_hash}")
+                    buffer.extend(physical_line)
+                    try:
+                        records = list(
+                            csv.reader(
+                                io.StringIO(buffer.decode("utf-8"), newline=""),
+                                strict=True,
+                            )
+                        )
+                    except csv.Error as exc:
+                        if "unexpected end of data" in str(exc).lower():
+                            continue
+                        raise
+                    if len(records) != 1 or len(records[0]) != len(header):
+                        raise csv.Error(f"invalid indexed transaction {expected_hash}")
+                    row = dict(zip(header, records[0]))
+                    if row["tx_hash"] != expected_hash:
+                        raise RuntimeError(
+                            f"stale transaction offset for {expected_hash}: found {row['tx_hash']}"
+                        )
+                    rows.append(row)
+                    break
+        return rows
+
+    def add_expansion_results(
+        self,
+        new_accounts: Sequence[Mapping[str, Any]],
+        new_crawl: Sequence[Mapping[str, Any]],
+        new_hops: Sequence[Mapping[str, Any]],
+        expanded: Sequence[str],
+    ) -> None:
+        """Persist discoveries before marking their parent rows expanded."""
+
+        expanded_addresses = list(dict.fromkeys(expanded))
+        missing = [address for address in expanded_addresses if address not in self.crawl_state]
+        if missing:
+            raise ValueError(f"crawl state missing for expanded: {', '.join(missing)}")
+
+        def nonnegative_level(value: Any, context: str) -> int:
+            if type(value) is int:
+                parsed = value
+            elif (
+                isinstance(value, str)
+                and value.isascii()
+                and value.isdigit()
+                and (value == "0" or not value.startswith("0"))
+            ):
+                parsed = int(value)
+            else:
+                raise ValueError(f"{context} hop_level must be a non-negative integer")
+            if parsed < 0:
+                raise ValueError(f"{context} hop_level must be a non-negative integer")
+            return parsed
+
+        validated_hops: list[tuple[Mapping[str, Any], int]] = []
+        for supplied in new_hops:
+            wallet = str(supplied.get("wallet_address", ""))
+            seed = str(supplied.get("seed_address", ""))
+            if not wallet or not seed:
+                raise ValueError("expanded hop requires wallet and seed")
+            validated_hops.append(
+                (supplied, nonnegative_level(supplied.get("hop_level"), "expanded hop"))
+            )
+
+        validated_crawl: list[tuple[Mapping[str, Any], int]] = []
+        for supplied in new_crawl:
+            address = str(supplied.get("address", ""))
+            seed = str(supplied.get("seed_address", ""))
+            if not address or not seed:
+                raise ValueError("expanded crawl requires address and seed_address")
+            validated_crawl.append(
+                (supplied, nonnegative_level(supplied.get("hop_level"), "expanded crawl"))
+            )
+
+        try:
+            timestamp = now_iso()
+            changed_accounts: list[str] = []
+            for supplied in new_accounts:
+                address = str(supplied.get("address", ""))
+                if not address:
+                    raise ValueError("expanded account address is required")
+                merged = dict(self.accounts.get(address, {}))
+                merged.update(supplied)
+                merged.setdefault("address", address)
+                merged.setdefault("created_at", timestamp)
+                merged.setdefault("created_date", timestamp[:10])
+                self.accounts[address] = merged
+                changed_accounts.append(address)
+            self._append_account_rows(changed_accounts)
+
+            appended_hops: list[dict[str, Any]] = []
+            for supplied, hop_level in validated_hops:
+                wallet = str(supplied.get("wallet_address", ""))
+                seed = str(supplied.get("seed_address", ""))
+                key = (wallet, seed, hop_level)
+                if key in self.hop_keys:
+                    continue
+                supplied_id = supplied.get("hop_id", "")
+                hop_id = int(supplied_id) if supplied_id not in (None, "") else self.max_hop_id + 1
+                if hop_id < 0:
+                    raise ValueError("expanded hop_id must be non-negative")
+                row = dict(supplied)
+                row["hop_id"] = hop_id
+                row["hop_level"] = hop_level
+                row.setdefault("discovered_at", timestamp)
+                self.max_hop_id = max(self.max_hop_id, hop_id)
+                self.hop_keys.add(key)
+                self.hops.append(row)
+                appended_hops.append(row)
+            self._append_rows(
+                self.wallet_hops_path,
+                self.headers["wallet_hops.csv"],
+                appended_hops,
+            )
+
+            changed_crawl: list[str] = []
+            for supplied, hop_level in validated_crawl:
+                address = str(supplied.get("address", ""))
+                current = self.crawl_state.get(address)
+                if current is not None and current["hop_level"] <= hop_level:
+                    continue
+                row: dict[str, Any] = dict(supplied)
+                row["address"] = address
+                row["hop_level"] = hop_level
+                row.setdefault("synced", False)
+                row.setdefault("expanded", False)
+                row.setdefault("is_supernode", False)
+                row.setdefault("created_at", timestamp)
+                row["updated_at"] = timestamp
+                self.crawl_state[address] = row
+                changed_crawl.append(address)
+            self._append_crawl_state_rows(changed_crawl)
+
+            for address in expanded_addresses:
+                self.crawl_state[address]["expanded"] = True
+                self.crawl_state[address]["updated_at"] = timestamp
+            self._append_crawl_state_rows(expanded_addresses)
+        except Exception:
+            try:
+                self.load()
+            except Exception:
+                logger.exception("failed to reload CSV state after expansion write error")
+            raise
+
+    def compact(self) -> None:
+        """Rewrite append-log account and crawl state as canonical snapshots."""
+
+        account_rows = [dict(row) for row in self.accounts.values()]
+        crawl_rows: list[dict[str, Any]] = []
+        for source in self.crawl_state.values():
+            row = dict(source)
+            for field in ("synced", "expanded", "is_supernode"):
+                value = source.get(field)
+                if type(value) is not bool:
+                    raise ValueError(f"crawl-state {field} must be bool")
+                row[field] = "TRUE" if value else "FALSE"
+            crawl_rows.append(row)
+
+        self._write_snapshot(
+            self.accounts_path,
+            self.headers["accounts.csv"],
+            account_rows,
+        )
+        self._write_snapshot(
+            self.crawl_state_path,
+            self.headers["pipeline_crawl_state.csv"],
+            crawl_rows,
+        )
+        self._appended_since_compact = 0
+
+    def compact_if_needed(self, factor: int = 10) -> None:
+        """Compact mutable logs after global appends strictly exceed their live-size ratio."""
+
+        if type(factor) is not int or factor <= 0:
+            raise ValueError("compaction factor must be a positive integer")
+        live_rows = len(self.accounts) + len(self.crawl_state)
+        if self._appended_since_compact > factor * live_rows:
+            self.compact()
+
+    def reset_to_seeds(self) -> None:
+        """Durably roll forward all mutable files to a seed-only dataset."""
+
+        timestamp = now_iso()
+        accounts: list[dict[str, Any]] = []
+        states: list[dict[str, Any]] = []
+        for address, seed in self.seeds.items():
+            account = dict(self.accounts.get(address, {}))
+            created_at = str(account.get("created_at") or seed.get("created_at") or timestamp)
+            account.setdefault("address", address)
+            account.setdefault("hex_address", seed.get("hex_address", to_hex(address)))
+            account.setdefault("first_seen_timestamp", "")
+            account.setdefault("last_seen_timestamp", "")
+            account.setdefault("created_date", created_at[:10])
+            account.setdefault("created_at", created_at)
+            accounts.append(account)
+            states.append(
+                {
+                    "address": address,
+                    "seed_address": address,
+                    "hop_level": 0,
+                    "synced": "FALSE",
+                    "expanded": "FALSE",
+                    "is_supernode": "FALSE",
+                    "created_at": str(seed.get("created_at") or created_at),
+                    "updated_at": timestamp,
+                }
+            )
+
+        marker_tmp = Path(f"{self._reset_marker_path}.tmp")
+        with marker_tmp.open("w", encoding="utf-8", newline="") as handle:
+            json.dump(
+                {"version": 1, "accounts": accounts, "crawl_state": states},
+                handle,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(marker_tmp, self._reset_marker_path)
+
+        self.load()
+        self._appended_since_compact = 0
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Compute health and completion metrics entirely from in-memory indexes."""
+
+        states = list(self.crawl_state.values())
+        pending_crawls = sum(not row["synced"] for row in states)
+        pending_expands = sum(
+            row["synced"] and not row["expanded"] for row in states
+        )
+        per_hop = {
+            level: sum(row["hop_level"] == level for row in states)
+            for level in range(6)
+        }
+
+        finished_seeds = 0
+        for seed in self.seeds:
+            seed_states = [row for row in states if row.get("seed_address") == seed]
+            if seed_states and all(
+                row["synced"] and row["expanded"] for row in seed_states
+            ):
+                finished_seeds += 1
+
+        return {
+            "total_seeds": len(self.seeds),
+            "total_accounts": len(self.accounts),
+            "total_transactions": len(self.tx_hashes),
+            "total_hops": len(self.hops),
+            "total_crawl_states": len(states),
+            "supernodes": sum(row["is_supernode"] for row in states),
+            "pending_crawls": pending_crawls,
+            "pending_expands": pending_expands,
+            "per_hop": per_hop,
+            "finished_seeds": finished_seeds,
+            "is_complete": bool(states)
+            and pending_crawls == 0
+            and pending_expands == 0,
+        }
