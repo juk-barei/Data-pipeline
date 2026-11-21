@@ -441,3 +441,37 @@ def test_append_account_rows_writes_current_known_rows_once(tmp_path):
     assert [row["address"] for row in rows] == ["T1", "T2"]
     assert rows[0]["last_seen_timestamp"] == "latest"
     assert store._appended_since_compact == 2
+
+
+def test_append_crawl_state_rows_encodes_booleans_without_mutating_memory(tmp_path):
+    store = CSVStore(str(tmp_path))
+    state = {
+        "address": "T1", "seed_address": "S1", "hop_level": 2,
+        "synced": True, "expanded": False, "is_supernode": False,
+        "created_at": "before", "updated_at": "now",
+    }
+    store.crawl_state = {"T1": state}
+
+    store._append_crawl_state_rows(["UNKNOWN", "T1", "T1"])
+
+    assert state["synced"] is True
+    assert state["expanded"] is False
+    rows = list(store._iter_rows(store.crawl_state_path))
+    assert len(rows) == 1
+    assert rows[0]["hop_level"] == "2"
+    assert (rows[0]["synced"], rows[0]["expanded"], rows[0]["is_supernode"]) == (
+        "TRUE", "FALSE", "FALSE"
+    )
+
+
+def test_append_crawl_state_rows_rejects_string_booleans(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.crawl_state["T1"] = {
+        "address": "T1", "hop_level": 0,
+        "synced": "FALSE", "expanded": False, "is_supernode": False,
+    }
+
+    with pytest.raises(ValueError, match="synced must be bool"):
+        store._append_crawl_state_rows(["T1"])
+
+    assert list(store._iter_rows(store.crawl_state_path)) == []

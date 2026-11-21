@@ -310,3 +310,26 @@ class CSVStore:
             self.headers["accounts.csv"],
             rows,
         )
+
+    def _append_crawl_state_rows(self, addresses: Sequence[str]) -> None:
+        """Append known typed crawl states with canonical boolean encoding."""
+
+        seen: set[str] = set()
+        rows: list[dict[str, Any]] = []
+        for address in addresses:
+            if address in seen or address not in self.crawl_state:
+                continue
+            seen.add(address)
+            source = self.crawl_state[address]
+            row = dict(source)
+            for field in ("synced", "expanded", "is_supernode"):
+                value = source.get(field)
+                if type(value) is not bool:
+                    raise ValueError(f"crawl-state {field} must be bool")
+                row[field] = "TRUE" if value else "FALSE"
+            rows.append(row)
+        self._append_rows(
+            self.crawl_state_path,
+            self.headers["pipeline_crawl_state.csv"],
+            rows,
+        )
