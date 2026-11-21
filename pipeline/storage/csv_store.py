@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
 import os
 from pathlib import Path
@@ -31,6 +32,7 @@ class CSVStore:
         self.transactions_path = self.paths["transactions.csv"]
         self.wallet_hops_path = self.paths["wallet_hops.csv"]
         self.crawl_state_path = self.paths["pipeline_crawl_state.csv"]
+        self._reset_marker_path = self.csv_dir / ".reset-to-seeds.json"
         self.retain_all_seeds = retain_all_seeds
         self._appended_since_compact = 0
 
@@ -283,6 +285,32 @@ class CSVStore:
 
     def load(self) -> None:
         """Rebuild all in-memory state from CSVs in dependency order."""
+
+        reset_marker = getattr(self, "_reset_marker_path", None)
+        if reset_marker is not None and reset_marker.is_file():
+            with reset_marker.open(encoding="utf-8") as handle:
+                reset = json.load(handle)
+            self._write_snapshot(
+                self.accounts_path,
+                self.headers["accounts.csv"],
+                reset["accounts"],
+            )
+            self._write_snapshot(
+                self.transactions_path,
+                self.headers["transactions.csv"],
+                [],
+            )
+            self._write_snapshot(
+                self.wallet_hops_path,
+                self.headers["wallet_hops.csv"],
+                [],
+            )
+            self._write_snapshot(
+                self.crawl_state_path,
+                self.headers["pipeline_crawl_state.csv"],
+                reset["crawl_state"],
+            )
+            reset_marker.unlink()
 
         self._load_seeds()
         self._load_accounts()
@@ -723,3 +751,47 @@ class CSVStore:
         live_rows = len(self.accounts) + len(self.crawl_state)
         if self._appended_since_compact > factor * live_rows:
             self.compact()
+
+    def reset_to_seeds(self) -> None:
+        """Durably roll forward all mutable files to a seed-only dataset."""
+
+        timestamp = now_iso()
+        accounts: list[dict[str, Any]] = []
+        states: list[dict[str, Any]] = []
+        for address, seed in self.seeds.items():
+            account = dict(self.accounts.get(address, {}))
+            created_at = str(account.get("created_at") or seed.get("created_at") or timestamp)
+            account.setdefault("address", address)
+            account.setdefault("hex_address", seed.get("hex_address", to_hex(address)))
+            account.setdefault("first_seen_timestamp", "")
+            account.setdefault("last_seen_timestamp", "")
+            account.setdefault("created_date", created_at[:10])
+            account.setdefault("created_at", created_at)
+            accounts.append(account)
+            states.append(
+                {
+                    "address": address,
+                    "seed_address": address,
+                    "hop_level": 0,
+                    "synced": "FALSE",
+                    "expanded": "FALSE",
+                    "is_supernode": "FALSE",
+                    "created_at": str(seed.get("created_at") or created_at),
+                    "updated_at": timestamp,
+                }
+            )
+
+        marker_tmp = Path(f"{self._reset_marker_path}.tmp")
+        with marker_tmp.open("w", encoding="utf-8", newline="") as handle:
+            json.dump(
+                {"version": 1, "accounts": accounts, "crawl_state": states},
+                handle,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(marker_tmp, self._reset_marker_path)
+
+        self.load()
+        self._appended_since_compact = 0

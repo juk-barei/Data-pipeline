@@ -939,3 +939,81 @@ def test_compact_if_needed_bounds_repeated_mutable_log_growth(tmp_path):
     assert store._appended_since_compact == 0
     assert len(list(store._iter_rows(store.accounts_path))) == 1
     assert len(list(store._iter_rows(store.crawl_state_path))) == 1
+
+
+def test_reset_to_seeds_preserves_seed_source_and_clears_all_derived_state(tmp_path):
+    store = CSVStore(str(tmp_path))
+    seed1 = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    seed2 = "TUoHaVjx7n5xz8LwPRDckgFrDWhMhuSuJM"
+    store.insert_seeds([
+        {"wallet_address": seed1, "label": 0},
+        {"wallet_address": seed2, "label": 0},
+    ])
+    store.upsert_crawled_data(
+        [],
+        [{"tx_hash": "h1", "from_address": seed1, "to_address": seed2}],
+        [seed1, seed2],
+        [],
+    )
+    child = "T-child"
+    store.add_expansion_results(
+        [{"address": child}],
+        [{"address": child, "seed_address": seed1, "hop_level": 1}],
+        [{"wallet_address": child, "seed_address": seed1, "hop_level": 1}],
+        [seed1],
+    )
+    seed_bytes = store.seed_wallets_path.read_bytes()
+
+    store.reset_to_seeds()
+
+    assert store.seed_wallets_path.read_bytes() == seed_bytes
+    assert set(store.accounts) == {seed1, seed2}
+    assert store.tx_hashes == set()
+    assert store.wallet_tx_hashes == {}
+    assert store.tx_offsets == {}
+    assert store.hops == []
+    assert store.hop_keys == set()
+    assert store.max_hop_id == 0
+    assert set(store.crawl_state) == {seed1, seed2}
+    assert all(
+        row["hop_level"] == 0
+        and row["synced"] is False
+        and row["expanded"] is False
+        and row["is_supernode"] is False
+        for row in store.crawl_state.values()
+    )
+    assert list(store._iter_rows(store.transactions_path)) == []
+    assert list(store._iter_rows(store.wallet_hops_path)) == []
+    assert store._appended_since_compact == 0
+    assert not store._reset_marker_path.exists()
+
+
+def test_reset_to_seeds_restart_rolls_forward_after_mid_reset_failure(tmp_path, monkeypatch):
+    store = CSVStore(str(tmp_path))
+    seed = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    store.insert_seeds([{"wallet_address": seed, "label": 0}])
+    store.upsert_crawled_data(
+        [], [{"tx_hash": "h1", "from_address": seed, "to_address": "T2"}], [seed], []
+    )
+    seed_bytes = store.seed_wallets_path.read_bytes()
+    real_write = store._write_snapshot
+
+    def fail_hops(path, header, rows):
+        if path == store.wallet_hops_path:
+            raise OSError("synthetic mid-reset failure")
+        real_write(path, header, rows)
+
+    monkeypatch.setattr(store, "_write_snapshot", fail_hops)
+    with pytest.raises(OSError, match="synthetic mid-reset failure"):
+        store.reset_to_seeds()
+    assert store._reset_marker_path.exists()
+
+    recovered = CSVStore(str(tmp_path))
+
+    assert recovered.seed_wallets_path.read_bytes() == seed_bytes
+    assert set(recovered.accounts) == {seed}
+    assert recovered.tx_hashes == set()
+    assert recovered.hops == []
+    assert recovered.crawl_state[seed]["hop_level"] == 0
+    assert recovered.crawl_state[seed]["synced"] is False
+    assert not recovered._reset_marker_path.exists()
