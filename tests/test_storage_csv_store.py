@@ -288,3 +288,40 @@ def test_load_transactions_builds_compact_first_wins_indexes(tmp_path):
     assert raw[store.tx_offsets["h1"] :].startswith(b"h1,T1,T2,1")
     assert raw[store.tx_offsets["h2"] :].startswith(b"h2,T2,T2,2")
     assert not hasattr(store, "transactions")
+
+
+def test_load_hops_deduplicates_edges_and_tracks_all_observed_ids(tmp_path):
+    path = tmp_path / "wallet_hops.csv"
+    store = bare_store()
+    store.wallet_hops_path = path
+    store._write_snapshot(
+        path,
+        ["hop_id", "wallet_address", "seed_address", "hop_level", "direction"],
+        [
+            {"hop_id": "2", "wallet_address": "T1", "seed_address": "S1", "hop_level": "1", "direction": "out"},
+            {"hop_id": "99", "wallet_address": "T1", "seed_address": "S1", "hop_level": "1", "direction": "duplicate"},
+            {"hop_id": "3", "wallet_address": "T1", "seed_address": "S2", "hop_level": "1", "direction": "out"},
+            {"hop_id": "4", "wallet_address": "T1", "seed_address": "S1", "hop_level": "2", "direction": "out"},
+        ],
+    )
+
+    store._load_hops()
+
+    assert len(store.hops) == 3
+    assert store.hop_keys == {("T1", "S1", 1), ("T1", "S2", 1), ("T1", "S1", 2)}
+    assert store.max_hop_id == 99
+    assert store.hops[0]["direction"] == "out"
+
+
+def test_load_hops_rejects_invalid_numeric_state(tmp_path):
+    path = tmp_path / "wallet_hops.csv"
+    store = bare_store()
+    store.wallet_hops_path = path
+    store._write_snapshot(
+        path,
+        ["hop_id", "wallet_address", "seed_address", "hop_level"],
+        [{"hop_id": "bad", "wallet_address": "T1", "seed_address": "S1", "hop_level": "0"}],
+    )
+
+    with pytest.raises(ValueError, match="must be integers"):
+        store._load_hops()

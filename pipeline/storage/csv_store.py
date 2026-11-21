@@ -194,3 +194,29 @@ class CSVStore:
             for address in {row.get("from_address", ""), row.get("to_address", "")}:
                 if address:
                     self.wallet_tx_hashes.setdefault(address, set()).add(tx_hash)
+
+    def _load_hops(self) -> None:
+        """Load unique hop edges and the greatest observed hop identifier."""
+
+        self.hops: list[dict[str, str]] = []
+        self.hop_keys: set[tuple[str, str, int]] = set()
+        self.max_hop_id = 0
+        for row in self._iter_rows(self.wallet_hops_path):
+            try:
+                hop_id = int(row.get("hop_id", ""))
+                hop_level = int(row.get("hop_level", ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("hop_id and hop_level must be integers") from exc
+            if hop_id < 0 or hop_level < 0:
+                raise ValueError("hop_id and hop_level must be non-negative")
+
+            wallet = row.get("wallet_address", "")
+            seed = row.get("seed_address", "")
+            if not wallet or not seed:
+                raise ValueError("wallet_address and seed_address are required")
+
+            self.max_hop_id = max(self.max_hop_id, hop_id)
+            key = (wallet, seed, hop_level)
+            if key not in self.hop_keys:
+                self.hop_keys.add(key)
+                self.hops.append(row)
