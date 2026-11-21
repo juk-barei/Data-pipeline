@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 
 from pipeline.api.cooldown import CooldownTracker
 
@@ -33,3 +34,29 @@ class MultiKeyPool:
         self._lock = asyncio.Lock()
         if not self.keys:
             logger.warning("No API keys configured; using public mode")
+
+
+    async def get_key(self) -> str:
+        """Acquire the next eligible key, yielding while every key is busy."""
+        if not self.keys:
+            return ""
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                earliest = math.inf
+                for offset in range(len(self.keys)):
+                    index = (self._index + offset) % len(self.keys)
+                    key = self.keys[index]
+                    ready_at = max(
+                        self._next_allowed[key],
+                        self.cooldown.cooldowns.get(key, 0.0),
+                    )
+                    if ready_at <= now:
+                        self._next_allowed[key] = now + self._interval
+                        self._index = (index + 1) % len(self.keys)
+                        return key
+                    earliest = min(earliest, ready_at)
+                delay = earliest - now
+            # Never hold the rotation lock while waiting: other keys and callers
+            # must remain independent, and cancellation must release all state.
+            await asyncio.sleep(delay)
