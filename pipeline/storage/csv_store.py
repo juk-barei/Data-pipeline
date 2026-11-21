@@ -177,3 +177,20 @@ class CSVStore:
             address = row.get("address", "")
             if address:
                 self.accounts[address] = row
+
+    def _load_transactions(self) -> None:
+        """Build compact hash, address, and byte-offset transaction indexes."""
+
+        self.tx_hashes: set[str] = set()
+        self.wallet_tx_hashes: dict[str, set[str]] = {}
+        self.tx_offsets: dict[str, int] = {}
+        for row in self._iter_rows(self.transactions_path):
+            tx_hash = row.get("tx_hash", "")
+            if not tx_hash or tx_hash in self.tx_hashes:
+                continue
+
+            self.tx_hashes.add(tx_hash)
+            self.tx_offsets[tx_hash] = self._current_row_offset
+            for address in {row.get("from_address", ""), row.get("to_address", "")}:
+                if address:
+                    self.wallet_tx_hashes.setdefault(address, set()).add(tx_hash)

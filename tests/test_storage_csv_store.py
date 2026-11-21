@@ -262,3 +262,29 @@ def test_load_accounts_keeps_latest_row_for_each_nonempty_address(tmp_path):
 
     assert set(store.accounts) == {"T1", "T2"}
     assert store.accounts["T1"]["last_seen_timestamp"] == "latest"
+
+
+def test_load_transactions_builds_compact_first_wins_indexes(tmp_path):
+    path = tmp_path / "transactions.csv"
+    store = bare_store()
+    store.transactions_path = path
+    store._write_snapshot(
+        path,
+        ["tx_hash", "from_address", "to_address", "amount"],
+        [
+            {"tx_hash": "h1", "from_address": "T1", "to_address": "T2", "amount": "1"},
+            {"tx_hash": "h2", "from_address": "T2", "to_address": "T2", "amount": "2"},
+            {"tx_hash": "h1", "from_address": "BAD", "to_address": "T3", "amount": "changed"},
+            {"tx_hash": "", "from_address": "T4", "to_address": "T5"},
+        ],
+    )
+
+    store._load_transactions()
+
+    assert store.tx_hashes == {"h1", "h2"}
+    assert store.wallet_tx_hashes == {"T1": {"h1"}, "T2": {"h1", "h2"}}
+    assert set(store.tx_offsets) == {"h1", "h2"}
+    raw = path.read_bytes()
+    assert raw[store.tx_offsets["h1"] :].startswith(b"h1,T1,T2,1")
+    assert raw[store.tx_offsets["h2"] :].startswith(b"h2,T2,T2,2")
+    assert not hasattr(store, "transactions")
