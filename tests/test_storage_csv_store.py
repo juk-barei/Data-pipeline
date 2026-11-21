@@ -426,3 +426,18 @@ def test_constructor_creates_canonical_files_and_reopen_loads_all_state(tmp_path
     reopened.load()
     assert "STALE" not in reopened.accounts
     assert reopened._appended_since_compact == 0
+
+
+def test_append_account_rows_writes_current_known_rows_once(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.accounts = {
+        "T1": {"address": "T1", "last_seen_timestamp": "latest", "created_at": "now"},
+        "T2": {"address": "T2", "last_seen_timestamp": "only", "created_at": "now"},
+    }
+
+    store._append_account_rows(["T1", "UNKNOWN", "T1", "T2"])
+
+    rows = list(store._iter_rows(store.accounts_path))
+    assert [row["address"] for row in rows] == ["T1", "T2"]
+    assert rows[0]["last_seen_timestamp"] == "latest"
+    assert store._appended_since_compact == 2

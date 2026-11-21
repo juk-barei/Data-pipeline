@@ -295,3 +295,18 @@ class CSVStore:
             len(self.hops),
             len(self.crawl_state),
         )
+
+    def _append_account_rows(self, addresses: Sequence[str]) -> None:
+        """Append current rows for known addresses once per requested address."""
+
+        seen: set[str] = set()
+        rows: list[Mapping[str, Any]] = []
+        for address in addresses:
+            if address not in seen and address in self.accounts:
+                seen.add(address)
+                rows.append(self.accounts[address])
+        self._append_rows(
+            self.accounts_path,
+            self.headers["accounts.csv"],
+            rows,
+        )
