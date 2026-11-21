@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import csv
+import io
 import os
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 class CSVStore:
@@ -43,10 +44,17 @@ class CSVStore:
         csv_path = Path(path)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         needs_header = not csv_path.exists() or csv_path.stat().st_size == 0
+        needs_record_separator = False
+        if not needs_header:
+            with csv_path.open("rb") as existing:
+                existing.seek(-1, os.SEEK_END)
+                needs_record_separator = existing.read(1) not in (b"\n", b"\r")
         with csv_path.open("a", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             if needs_header:
                 writer.writerow(list(header))
+            elif needs_record_separator:
+                handle.write("\r\n")
             writer.writerows(self._row_to_list(row, header) for row in pending)
             handle.flush()
             os.fsync(handle.fileno())
@@ -73,3 +81,75 @@ class CSVStore:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, csv_path)
+
+    def _iter_rows(self, path: str | Path) -> Iterator[dict[str, str]]:
+        """Stream complete CSV records and remove only a torn final record."""
+
+        csv_path = Path(path)
+        if not csv_path.is_file() or csv_path.stat().st_size == 0:
+            return
+
+        file_size = csv_path.stat().st_size
+        last_good_offset = 0
+        record_start = 0
+        header: list[str] | None = None
+        buffer = bytearray()
+        torn_tail = False
+
+        with csv_path.open("rb") as handle:
+            while True:
+                physical_line = handle.readline()
+                if not physical_line:
+                    break
+                buffer.extend(physical_line)
+                at_eof = handle.tell() == file_size
+
+                try:
+                    decoded = buffer.decode("utf-8-sig" if record_start == 0 else "utf-8")
+                    records = list(csv.reader(io.StringIO(decoded, newline=""), strict=True))
+                except UnicodeDecodeError:
+                    if at_eof:
+                        torn_tail = True
+                        break
+                    raise
+                except csv.Error as exc:
+                    if "unexpected end of data" in str(exc).lower():
+                        if at_eof:
+                            torn_tail = True
+                            break
+                        continue
+                    raise
+
+                if len(records) != 1:
+                    raise csv.Error("one logical CSV record expected")
+                fields = records[0]
+                record_end = handle.tell()
+
+                if header is None:
+                    if not fields or any(not column for column in fields):
+                        raise csv.Error("CSV header contains an empty column")
+                    header = fields
+                elif len(fields) != len(header):
+                    if (
+                        len(fields) < len(header)
+                        and at_eof
+                        and not physical_line.endswith((b"\n", b"\r"))
+                    ):
+                        torn_tail = True
+                        break
+                    raise csv.Error(
+                        f"CSV record has {len(fields)} fields; expected {len(header)}"
+                    )
+                else:
+                    self._current_row_offset = record_start
+                    yield dict(zip(header, fields))
+
+                last_good_offset = record_end
+                record_start = record_end
+                buffer.clear()
+
+        if torn_tail:
+            with csv_path.open("r+b") as handle:
+                handle.truncate(last_good_offset)
+                handle.flush()
+                os.fsync(handle.fileno())
