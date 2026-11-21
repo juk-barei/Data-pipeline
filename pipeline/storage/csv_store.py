@@ -487,3 +487,23 @@ class CSVStore:
             ),
         )
         return [dict(row) for row in ordered[:n]]
+
+    def claim_expand_batch(self, n: int) -> list[dict[str, Any]]:
+        """Return synced, unexpanded rows ordered by breadth-first priority."""
+
+        if type(n) is not int or n < 0:
+            raise ValueError("batch size must be a non-negative integer")
+        pending = (
+            row
+            for row in self.crawl_state.values()
+            if row["synced"] and not row["expanded"]
+        )
+        ordered = sorted(
+            pending,
+            key=lambda row: (
+                row["hop_level"],
+                str(row.get("created_at", "")),
+                str(row.get("address", "")),
+            ),
+        )
+        return [dict(row) for row in ordered[:n]]

@@ -645,3 +645,26 @@ def test_claim_crawl_batch_orders_frontier_without_mutating_state(tmp_path):
 def test_claim_crawl_batch_rejects_invalid_sizes(tmp_path, size):
     with pytest.raises(ValueError, match="non-negative integer"):
         CSVStore(str(tmp_path)).claim_crawl_batch(size)
+
+
+def test_claim_expand_batch_includes_supernodes_and_hop_five_for_later_pruning(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.crawl_state = {
+        "PENDING": {"address": "PENDING", "hop_level": 0, "created_at": "2026-01-01", "synced": False, "expanded": False, "is_supernode": False},
+        "DONE": {"address": "DONE", "hop_level": 0, "created_at": "2026-01-01", "synced": True, "expanded": True, "is_supernode": False},
+        "HOP5": {"address": "HOP5", "hop_level": 5, "created_at": "2026-01-01", "synced": True, "expanded": False, "is_supernode": False},
+        "SUPER": {"address": "SUPER", "hop_level": 1, "created_at": "2026-01-02", "synced": True, "expanded": False, "is_supernode": True},
+        "FIRST": {"address": "FIRST", "hop_level": 1, "created_at": "2026-01-01", "synced": True, "expanded": False, "is_supernode": False},
+    }
+
+    claimed = store.claim_expand_batch(3)
+
+    assert [row["address"] for row in claimed] == ["FIRST", "SUPER", "HOP5"]
+    claimed[0]["expanded"] = True
+    assert store.crawl_state["FIRST"]["expanded"] is False
+
+
+@pytest.mark.parametrize("size", [-1, False, 1.5, "2"])
+def test_claim_expand_batch_rejects_invalid_sizes(tmp_path, size):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        CSVStore(str(tmp_path)).claim_expand_batch(size)
