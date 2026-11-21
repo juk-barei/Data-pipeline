@@ -241,3 +241,24 @@ def test_load_seeds_can_retain_all_latest_rows(tmp_path):
 
     assert store.seeds["T1"]["label"] == "1"
     assert set(store.seeds) == {"T1", "T2"}
+
+
+def test_load_accounts_keeps_latest_row_for_each_nonempty_address(tmp_path):
+    path = tmp_path / "accounts.csv"
+    store = bare_store()
+    store.accounts_path = path
+    store._write_snapshot(
+        path,
+        ["address", "last_seen_timestamp", "created_at"],
+        [
+            {"address": "T1", "last_seen_timestamp": "old"},
+            {"address": "T2", "last_seen_timestamp": "only"},
+            {"address": "", "last_seen_timestamp": "invalid"},
+            {"address": "T1", "last_seen_timestamp": "latest"},
+        ],
+    )
+
+    store._load_accounts()
+
+    assert set(store.accounts) == {"T1", "T2"}
+    assert store.accounts["T1"]["last_seen_timestamp"] == "latest"

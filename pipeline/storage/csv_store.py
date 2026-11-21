@@ -168,3 +168,12 @@ class CSVStore:
             self.seeds = {
                 wallet: row for wallet, row in latest.items() if row.get("label") == "0"
             }
+
+    def _load_accounts(self) -> None:
+        """Load account rows keyed by address with latest append winning."""
+
+        self.accounts = {}
+        for row in self._iter_rows(self.accounts_path):
+            address = row.get("address", "")
+            if address:
+                self.accounts[address] = row
