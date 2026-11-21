@@ -622,3 +622,26 @@ def test_upsert_crawled_data_failure_reloads_unsynced_state_and_can_retry(tmp_pa
     store.upsert_crawled_data([], [tx], [address], [])
     assert store.crawl_state[address]["synced"] is True
     assert store.tx_hashes == {"retry-hash"}
+
+
+def test_claim_crawl_batch_orders_frontier_without_mutating_state(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.crawl_state = {
+        "T3": {"address": "T3", "hop_level": 2, "created_at": "2026-01-01T00:00:00+00:00", "synced": False},
+        "T2": {"address": "T2", "hop_level": 1, "created_at": "2026-01-02T00:00:00+00:00", "synced": False},
+        "T1": {"address": "T1", "hop_level": 1, "created_at": "2026-01-01T00:00:00+00:00", "synced": False},
+        "DONE": {"address": "DONE", "hop_level": 0, "created_at": "2025-01-01T00:00:00+00:00", "synced": True},
+    }
+
+    claimed = store.claim_crawl_batch(2)
+
+    assert [row["address"] for row in claimed] == ["T1", "T2"]
+    claimed[0]["synced"] = True
+    assert store.crawl_state["T1"]["synced"] is False
+    assert store.claim_crawl_batch(0) == []
+
+
+@pytest.mark.parametrize("size", [-1, True, 1.5, "1"])
+def test_claim_crawl_batch_rejects_invalid_sizes(tmp_path, size):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        CSVStore(str(tmp_path)).claim_crawl_batch(size)

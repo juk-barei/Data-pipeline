@@ -471,3 +471,19 @@ class CSVStore:
             except Exception:
                 logger.exception("failed to reload CSV state after crawl-batch error")
             raise
+
+    def claim_crawl_batch(self, n: int) -> list[dict[str, Any]]:
+        """Return immutable-by-copy frontier work ordered by breadth-first priority."""
+
+        if type(n) is not int or n < 0:
+            raise ValueError("batch size must be a non-negative integer")
+        pending = (row for row in self.crawl_state.values() if not row["synced"])
+        ordered = sorted(
+            pending,
+            key=lambda row: (
+                row["hop_level"],
+                str(row.get("created_at", "")),
+                str(row.get("address", "")),
+            ),
+        )
+        return [dict(row) for row in ordered[:n]]
