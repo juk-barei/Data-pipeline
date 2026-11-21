@@ -900,3 +900,42 @@ def test_compact_second_snapshot_failure_keeps_counter_and_coherent_first_file(t
 
     assert store._appended_since_compact == counter_before
     assert list(store._iter_rows(store.accounts_path)) == [store.accounts[address]]
+
+
+def test_compact_if_needed_uses_strict_live_row_threshold(tmp_path, monkeypatch):
+    store = CSVStore(str(tmp_path))
+    store.accounts = {"A": {}}
+    store.crawl_state = {"A": {}}
+    calls = []
+    monkeypatch.setattr(store, "compact", lambda: calls.append("compact"))
+
+    store._appended_since_compact = 6
+    store.compact_if_needed(factor=3)
+    assert calls == []
+
+    store._appended_since_compact = 7
+    store.compact_if_needed(factor=3)
+    assert calls == ["compact"]
+
+
+@pytest.mark.parametrize("factor", [0, -1, True, 1.5, "10"])
+def test_compact_if_needed_rejects_invalid_factor(tmp_path, factor):
+    with pytest.raises(ValueError, match="positive integer"):
+        CSVStore(str(tmp_path)).compact_if_needed(factor)
+
+
+def test_compact_if_needed_bounds_repeated_mutable_log_growth(tmp_path):
+    store = CSVStore(str(tmp_path))
+    address = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    store.insert_seeds([{"wallet_address": address, "label": 0}])
+    for index in range(8):
+        store.accounts[address]["last_seen_timestamp"] = str(index)
+        store._append_account_rows([address])
+        store.crawl_state[address]["updated_at"] = str(index)
+        store._append_crawl_state_rows([address])
+
+    store.compact_if_needed(factor=2)
+
+    assert store._appended_since_compact == 0
+    assert len(list(store._iter_rows(store.accounts_path))) == 1
+    assert len(list(store._iter_rows(store.crawl_state_path))) == 1

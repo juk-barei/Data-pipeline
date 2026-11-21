@@ -714,3 +714,12 @@ class CSVStore:
             crawl_rows,
         )
         self._appended_since_compact = 0
+
+    def compact_if_needed(self, factor: int = 10) -> None:
+        """Compact mutable logs after global appends strictly exceed their live-size ratio."""
+
+        if type(factor) is not int or factor <= 0:
+            raise ValueError("compaction factor must be a positive integer")
+        live_rows = len(self.accounts) + len(self.crawl_state)
+        if self._appended_since_compact > factor * live_rows:
+            self.compact()
