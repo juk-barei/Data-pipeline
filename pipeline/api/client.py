@@ -120,3 +120,39 @@ class TronGridClient:
             seen.add(fingerprint)
             params["fingerprint"] = fingerprint
         return records
+
+
+    async def get_trc20_transfers(self, address: str, contract: str) -> list[dict]:
+        """Fetch confirmed token transfers for one contract, up to the cap."""
+        params = {
+            "only_confirmed": "true",
+            "limit": PAGE_SIZE,
+            "contract_address": contract,
+        }
+        records: list[dict] = []
+        seen: set[str] = set()
+        while len(records) < MAX_RECORDS_PER_ADDRESS:
+            response = await self._request(
+                f"/v1/accounts/{quote(address, safe='')}/transactions/trc20", params
+            )
+            page = response.get("data", [])
+            if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+                raise ValueError("TronGrid transaction data must be a list of objects")
+            records.extend(page[: MAX_RECORDS_PER_ADDRESS - len(records)])
+            if not page or len(records) >= MAX_RECORDS_PER_ADDRESS:
+                break
+            meta = response.get("meta", {})
+            if not isinstance(meta, dict):
+                raise ValueError("TronGrid pagination metadata must be an object")
+            fingerprint = meta.get("fingerprint")
+            if fingerprint is None:
+                break
+            if not isinstance(fingerprint, str):
+                raise ValueError("TronGrid fingerprint must be a string")
+            if not fingerprint:
+                break
+            if fingerprint in seen:
+                break
+            seen.add(fingerprint)
+            params["fingerprint"] = fingerprint
+        return records
