@@ -13,6 +13,7 @@ from pipeline.utils.async_utils import async_retry
 
 MAX_RECORDS_PER_ADDRESS = 10_000
 PAGE_SIZE = 200
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
 
 class TronGridClient:
@@ -140,6 +141,45 @@ class TronGridClient:
                 raise ValueError("TronGrid transaction data must be a list of objects")
             records.extend(page[: MAX_RECORDS_PER_ADDRESS - len(records)])
             if not page or len(records) >= MAX_RECORDS_PER_ADDRESS:
+                break
+            meta = response.get("meta", {})
+            if not isinstance(meta, dict):
+                raise ValueError("TronGrid pagination metadata must be an object")
+            fingerprint = meta.get("fingerprint")
+            if fingerprint is None:
+                break
+            if not isinstance(fingerprint, str):
+                raise ValueError("TronGrid fingerprint must be a string")
+            if not fingerprint:
+                break
+            if fingerprint in seen:
+                break
+            seen.add(fingerprint)
+            params["fingerprint"] = fingerprint
+        return records
+
+
+    async def get_recent_usdt_transfers(self, limit: int) -> list[dict]:
+        """Return up to limit recent confirmed USDT Transfer events."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a nonnegative integer")
+        if limit == 0:
+            return []
+        params = {
+            "event_name": "Transfer",
+            "only_confirmed": "true",
+            "order_by": "block_timestamp,desc",
+            "limit": min(PAGE_SIZE, limit),
+        }
+        records: list[dict] = []
+        seen: set[str] = set()
+        while len(records) < limit:
+            response = await self._request(f"/v1/contracts/{USDT_CONTRACT}/events", params)
+            page = response.get("data", [])
+            if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+                raise ValueError("TronGrid event data must be a list of objects")
+            records.extend(page[: limit - len(records)])
+            if not page or len(records) >= limit:
                 break
             meta = response.get("meta", {})
             if not isinstance(meta, dict):

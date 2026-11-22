@@ -385,3 +385,48 @@ def test_trc20_history_propagates_later_page_failure(mock_client):
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(mock_client(handler).get_trc20_transfers("wallet", "usdt-contract"))
     assert len(calls) == 4
+
+
+@pytest.mark.parametrize("limit", [0, 1, 200, 201, 401])
+def test_recent_usdt_events_respect_limit_and_keep_filters(mock_client, limit):
+    from pipeline.api.client import USDT_CONTRACT
+
+    requests = []
+
+    def handler(request):
+        requests.append(dict(request.url.params))
+        assert request.url.path == f"/v1/contracts/{USDT_CONTRACT}/events"
+        assert request.url.params["event_name"] == "Transfer"
+        assert request.url.params["only_confirmed"] == "true"
+        assert request.url.params["order_by"] == "block_timestamp,desc"
+        assert request.url.params["limit"] == str(min(limit, 200))
+        page = len(requests)
+        return httpx.Response(200, json={"data": [{"transaction_id": str(i)} for i in range((page-1)*200, page*200)], "meta": {"fingerprint": f"page-{page}"}})
+
+    result = asyncio.run(mock_client(handler).get_recent_usdt_transfers(limit))
+    assert len(result) == limit
+    assert len(requests) == (limit + 199) // 200
+    if limit > 200:
+        assert requests[1]["fingerprint"] == "page-1"
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5, "2", None])
+def test_recent_usdt_events_reject_invalid_limits_without_requests(mock_client, limit):
+    handler = Mock(return_value=httpx.Response(200, json={}))
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        asyncio.run(mock_client(handler).get_recent_usdt_transfers(limit))
+    assert handler.call_count == 0
+
+
+@pytest.mark.parametrize("payload, expected_calls", [({}, 1), ({"data": []}, 1), ({"data": [{}]}, 1), ({"data": [{}], "meta": {"fingerprint": "same"}}, 2)])
+def test_recent_usdt_events_stop_without_progress(mock_client, payload, expected_calls):
+    handler = Mock(return_value=httpx.Response(200, json=payload))
+    result = asyncio.run(mock_client(handler).get_recent_usdt_transfers(1000))
+    assert handler.call_count == expected_calls
+    assert len(result) <= 1000
+
+
+@pytest.mark.parametrize("payload", [{"data": None}, {"data": [None]}, {"data": [{}], "meta": []}, {"data": [{}], "meta": {"fingerprint": 1}}, *[{"data": [{}], "meta": {"fingerprint": value}} for value in [0, False, [], {}]]])
+def test_recent_usdt_events_reject_malformed_response(mock_client, payload):
+    with pytest.raises(ValueError):
+        asyncio.run(mock_client(lambda request: httpx.Response(200, json=payload)).get_recent_usdt_transfers(10))
