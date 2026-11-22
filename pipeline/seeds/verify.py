@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 
 from pipeline.api.client import TronGridClient
 from pipeline.utils.address import normalize_address
 
 
 logger = logging.getLogger(__name__)
+_RISK_MARKER = re.compile(r"\b(?:scam(?:mers?|ming|s)?|phish(?:ers?|ing)?|hack(?:ers?|ed|ing)?)\b")
 
 
 async def is_banned_on_tether(client: TronGridClient, address: str) -> bool:
@@ -25,4 +28,42 @@ async def is_banned_on_tether(client: TronGridClient, address: str) -> bool:
     except Exception as exc:
         # Exception messages can contain request headers or credentials.
         logger.warning("Tether check failed for %s (%s)", canonical, type(exc).__name__)
+        return False
+
+
+async def is_flagged_on_tronscan(client: TronGridClient, address: str) -> bool:
+    """Read TronScan account risk flags, failing open when unavailable.
+
+    TRONSCAN_API_KEY is separate from the TronGrid pool. Reuse the HTTP
+    connection pool, but bypass _request, which adds a TronGrid credential.
+    Missing credentials and invalid addresses make no HTTP requests.
+    """
+    canonical = normalize_address(address)
+    key = os.getenv("TRONSCAN_API_KEY", "").strip()
+    if not canonical or not key:
+        return False
+    try:
+        response = await client._client.get(
+            "https://apilist.tronscanapi.com/api/accountv2",
+            params={"address": canonical},
+            headers={"TRON-PRO-API-KEY": key},
+            follow_redirects=False,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("TronScan account response must be an object")
+        if payload.get("feedbackRisk") is True:
+            return True
+        # redTag is explicitly a risk label, unlike ordinary public labels.
+        red_tag = payload.get("redTag")
+        if isinstance(red_tag, str) and red_tag.strip():
+            return True
+        for field in ("addressTag", "publicTag", "greyTag"):
+            tag = payload.get(field)
+            if isinstance(tag, str) and _RISK_MARKER.search(tag.lower().replace("_", " ")):
+                return True
+        return False
+    except Exception as exc:
+        logger.warning("TronScan check failed for %s (%s)", canonical, type(exc).__name__)
         return False
