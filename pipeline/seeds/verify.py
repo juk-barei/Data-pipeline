@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -67,3 +68,36 @@ async def is_flagged_on_tronscan(client: TronGridClient, address: str) -> bool:
     except Exception as exc:
         logger.warning("TronScan check failed for %s (%s)", canonical, type(exc).__name__)
         return False
+
+
+async def verify_licit(client: TronGridClient, address: str, blacklist: set[str]) -> bool:
+    """Accept a valid address only when no configured risk source rejects it.
+
+    The blacklist must contain normalized addresses, as load_local_blacklist
+    returns. A local rejection requires no network I/O. Remote checks overlap
+    and a rejection cancels and awaits the other request. Each probe retains
+    its documented fail-open behavior; cancellation and unexpected bugs still
+    propagate instead of silently accepting the candidate.
+    """
+    canonical = normalize_address(address)
+    if not canonical or canonical in blacklist:
+        return False
+    tasks = [
+        asyncio.create_task(is_banned_on_tether(client, canonical)),
+        asyncio.create_task(is_flagged_on_tronscan(client, canonical)),
+    ]
+    pending = set(tasks)
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            # Read every completed result so an unexpected probe error cannot
+            # be hidden by a rejection that completed in the same loop turn.
+            results = [task.result() for task in done]
+            if any(results):
+                return False
+        return True
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

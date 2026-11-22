@@ -7,7 +7,7 @@ import httpx
 
 from pipeline.api.client import TronGridClient
 from pipeline.api.keypool import MultiKeyPool
-from pipeline.seeds.verify import is_banned_on_tether, is_flagged_on_tronscan
+from pipeline.seeds.verify import is_banned_on_tether, is_flagged_on_tronscan, verify_licit
 from pipeline.utils.address import to_hex
 
 
@@ -176,3 +176,144 @@ def test_tronscan_cancellation_propagates(make_scan_client):
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(is_flagged_on_tronscan(make_scan_client(handler), ADDRESS))
+
+
+def test_verify_runs_independent_checks_concurrently_and_normalizes_input(monkeypatch):
+    started = set()
+    both_started = asyncio.Event()
+
+    async def check(name, client, address):
+        assert address == ADDRESS
+        started.add(name)
+        if len(started) == 2:
+            both_started.set()
+        await both_started.wait()
+        return False
+
+    monkeypatch.setattr(
+        "pipeline.seeds.verify.is_banned_on_tether", lambda c, a: check("tether", c, a)
+    )
+    monkeypatch.setattr(
+        "pipeline.seeds.verify.is_flagged_on_tronscan", lambda c, a: check("tronscan", c, a)
+    )
+
+    async def run():
+        return await asyncio.wait_for(verify_licit(object(), to_hex(ADDRESS), set()), 1)
+
+    assert asyncio.run(run()) is True
+    assert started == {"tether", "tronscan"}
+
+
+@pytest.mark.parametrize("address,blacklist", [
+    (ADDRESS, {ADDRESS}), (to_hex(ADDRESS), {ADDRESS}), ("invalid", set()), (None, set()),
+])
+def test_verify_local_rejection_makes_no_remote_checks(monkeypatch, address, blacklist):
+    tether = AsyncMock()
+    scan = AsyncMock()
+    monkeypatch.setattr("pipeline.seeds.verify.is_banned_on_tether", tether)
+    monkeypatch.setattr("pipeline.seeds.verify.is_flagged_on_tronscan", scan)
+    assert asyncio.run(verify_licit(object(), address, blacklist)) is False
+    tether.assert_not_awaited()
+    scan.assert_not_awaited()
+
+
+@pytest.mark.parametrize("rejecting_probe", ["tether", "tronscan"])
+def test_verify_remote_rejection_cancels_and_awaits_other_probe(monkeypatch, rejecting_probe):
+    waiting = asyncio.Event()
+    cleaned = []
+
+    async def reject(client, address):
+        await waiting.wait()
+        return True
+
+    async def wait_forever(client, address):
+        waiting.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.append(True)
+
+    monkeypatch.setattr(
+        "pipeline.seeds.verify.is_banned_on_tether",
+        reject if rejecting_probe == "tether" else wait_forever,
+    )
+    monkeypatch.setattr(
+        "pipeline.seeds.verify.is_flagged_on_tronscan",
+        reject if rejecting_probe == "tronscan" else wait_forever,
+    )
+
+    async def run():
+        result = await asyncio.wait_for(verify_licit(object(), ADDRESS, set()), 1)
+        assert cleaned == [True]
+        return result
+
+    assert asyncio.run(run()) is False
+
+
+def test_verify_keeps_documented_fail_open_behavior(monkeypatch, caplog):
+    monkeypatch.delenv("TRONSCAN_API_KEY", raising=False)
+    client = SimpleNamespace(call_is_blacklisted=AsyncMock(side_effect=RuntimeError("offline")))
+    assert asyncio.run(verify_licit(client, ADDRESS, set())) is True
+    assert "Tether check failed" in caplog.text
+
+
+def test_verify_caller_cancellation_cleans_up_both_probes(monkeypatch):
+    started = []
+    cleaned = []
+    both_started = asyncio.Event()
+
+    async def probe(client, address):
+        started.append(True)
+        if len(started) == 2:
+            both_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.append(True)
+
+    monkeypatch.setattr("pipeline.seeds.verify.is_banned_on_tether", probe)
+    monkeypatch.setattr("pipeline.seeds.verify.is_flagged_on_tronscan", probe)
+
+    async def run():
+        task = asyncio.create_task(verify_licit(object(), ADDRESS, set()))
+        await asyncio.wait_for(both_started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(cleaned) == 2
+
+    asyncio.run(run())
+
+
+def test_verify_unexpected_probe_bug_propagates_and_cleans_up_sibling(monkeypatch):
+    started = asyncio.Event()
+    cleaned = []
+
+    async def fail(client, address):
+        await started.wait()
+        raise RuntimeError("unexpected implementation bug")
+
+    async def wait_forever(client, address):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.append(True)
+
+    monkeypatch.setattr("pipeline.seeds.verify.is_banned_on_tether", fail)
+    monkeypatch.setattr("pipeline.seeds.verify.is_flagged_on_tronscan", wait_forever)
+    with pytest.raises(RuntimeError, match="unexpected implementation bug"):
+        asyncio.run(verify_licit(object(), ADDRESS, set()))
+    assert cleaned == [True]
+
+
+def test_verify_simultaneous_rejection_does_not_hide_unexpected_probe_bug(monkeypatch):
+    monkeypatch.setattr(
+        "pipeline.seeds.verify.is_banned_on_tether", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        "pipeline.seeds.verify.is_flagged_on_tronscan",
+        AsyncMock(side_effect=RuntimeError("unexpected implementation bug")),
+    )
+    with pytest.raises(RuntimeError, match="unexpected implementation bug"):
+        asyncio.run(verify_licit(object(), ADDRESS, set()))
