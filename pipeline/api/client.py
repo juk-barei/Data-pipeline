@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from urllib.parse import quote
 
 import httpx
 
@@ -74,3 +75,12 @@ class TronGridClient:
             raise RuntimeError("unreachable")
 
         return await async_retry(attempt, attempts=3)
+
+
+    async def get_account(self, address: str) -> dict | None:
+        """Return the first account record, or None for an unknown account."""
+        response = await self._request(f"/v1/accounts/{quote(address, safe='')}")
+        data = response.get("data", [])
+        if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+            raise ValueError("TronGrid account data must be a list of objects")
+        return data[0] if data else None

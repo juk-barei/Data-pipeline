@@ -227,3 +227,38 @@ def test_concurrent_requests_keep_their_own_key_headers(mock_client):
 
     assert asyncio.run(request_both()) == [{"key": "one"}, {"key": "two"}]
     assert observed == [("/a", "one"), ("/b", "two")]
+
+
+@pytest.mark.parametrize("payload", [{}, {"data": []}])
+def test_get_account_unknown_returns_none(mock_client, payload):
+    client = mock_client(lambda request: httpx.Response(200, json=payload))
+    assert asyncio.run(client.get_account("wallet")) is None
+
+
+def test_get_account_returns_first_record(mock_client):
+    def handler(request):
+        assert request.url.path == "/v1/accounts/wallet"
+        return httpx.Response(200, json={"data": [{"address": "first"}, {"address": "second"}]})
+
+    client = mock_client(handler)
+    assert asyncio.run(client.get_account("wallet")) == {"address": "first"}
+
+
+def test_get_account_404_returns_none(mock_client):
+    client = mock_client(lambda request: httpx.Response(404))
+    assert asyncio.run(client.get_account("missing")) is None
+
+
+@pytest.mark.parametrize("data", [None, {}, "bad", [None]])
+def test_get_account_rejects_malformed_data(mock_client, data):
+    client = mock_client(lambda request: httpx.Response(200, json={"data": data}))
+    with pytest.raises(ValueError, match="account data"):
+        asyncio.run(client.get_account("wallet"))
+
+
+def test_get_account_encodes_path_input(mock_client):
+    def handler(request):
+        assert request.url.raw_path == b"/v1/accounts/a%2Fb%3Fc"
+        return httpx.Response(200, json={"data": []})
+
+    assert asyncio.run(mock_client(handler).get_account("a/b?c")) is None
