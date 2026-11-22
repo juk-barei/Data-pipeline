@@ -262,3 +262,64 @@ def test_get_account_encodes_path_input(mock_client):
         return httpx.Response(200, json={"data": []})
 
     assert asyncio.run(mock_client(handler).get_account("a/b?c")) is None
+
+
+@pytest.mark.parametrize("cap", [1, 3, 4])
+def test_trx_history_paginates_with_fixed_filters_and_exact_cap(mock_client, monkeypatch, cap):
+    monkeypatch.setattr("pipeline.api.client.MAX_RECORDS_PER_ADDRESS", cap)
+    observed = []
+
+    def handler(request):
+        observed.append(dict(request.url.params))
+        assert request.url.path == "/v1/accounts/wallet/transactions"
+        assert request.url.params["only_confirmed"] == "true"
+        assert request.url.params["limit"] == "200"
+        page = len(observed)
+        return httpx.Response(200, json={"data": [{"txID": f"{page}-a"}, {"txID": f"{page}-b"}], "meta": {"fingerprint": f"page-{page}"}})
+
+    result = asyncio.run(mock_client(handler).get_trx_transactions("wallet"))
+    assert len(result) == cap
+    assert len(observed) == (cap + 1) // 2
+    assert "fingerprint" not in observed[0]
+    if cap > 2:
+        assert observed[1]["fingerprint"] == "page-1"
+
+
+@pytest.mark.parametrize("payload", [{}, {"data": []}, {"data": [], "meta": {"fingerprint": "unused"}}])
+def test_trx_history_empty_stops_without_more_requests(mock_client, payload):
+    handler = Mock(return_value=httpx.Response(200, json=payload))
+    assert asyncio.run(mock_client(handler).get_trx_transactions("wallet")) == []
+    assert handler.call_count == 1
+
+
+def test_trx_history_stops_on_missing_fingerprint(mock_client):
+    handler = Mock(return_value=httpx.Response(200, json={"data": [{"txID": "one"}]}))
+    assert asyncio.run(mock_client(handler).get_trx_transactions("wallet")) == [{"txID": "one"}]
+    assert handler.call_count == 1
+
+
+def test_trx_history_stops_on_repeated_fingerprint(mock_client):
+    handler = Mock(return_value=httpx.Response(200, json={"data": [{"txID": "one"}], "meta": {"fingerprint": "same"}}))
+    asyncio.run(mock_client(handler).get_trx_transactions("wallet"))
+    assert handler.call_count == 2
+
+
+@pytest.mark.parametrize("payload", [{"data": None}, {"data": {}}, {"data": [None]}, {"data": [{}], "meta": []}, {"data": [{}], "meta": {"fingerprint": 42}}, *[{"data": [{}], "meta": {"fingerprint": value}} for value in [0, False, [], {}]]])
+def test_trx_history_rejects_malformed_pages(mock_client, payload):
+    client = mock_client(lambda request: httpx.Response(200, json=payload))
+    with pytest.raises(ValueError):
+        asyncio.run(client.get_trx_transactions("wallet"))
+
+
+def test_trx_history_propagates_later_page_failure(mock_client):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, json={"data": [{"txID": "one"}], "meta": {"fingerprint": "next"}})
+        return httpx.Response(503)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(mock_client(handler).get_trx_transactions("wallet"))
+    assert len(calls) == 4

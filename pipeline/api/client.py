@@ -11,6 +11,10 @@ from pipeline.api.keypool import MultiKeyPool
 from pipeline.utils.async_utils import async_retry
 
 
+MAX_RECORDS_PER_ADDRESS = 10_000
+PAGE_SIZE = 200
+
+
 class TronGridClient:
     """Own a reusable HTTP connection pool and a shared key pool."""
 
@@ -84,3 +88,35 @@ class TronGridClient:
         if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
             raise ValueError("TronGrid account data must be a list of objects")
         return data[0] if data else None
+
+
+    async def get_trx_transactions(self, address: str) -> list[dict]:
+        """Fetch confirmed account history, bounded by the per-address cap."""
+        params = {"only_confirmed": "true", "limit": PAGE_SIZE}
+        records: list[dict] = []
+        seen: set[str] = set()
+        while len(records) < MAX_RECORDS_PER_ADDRESS:
+            response = await self._request(
+                f"/v1/accounts/{quote(address, safe='')}/transactions", params
+            )
+            page = response.get("data", [])
+            if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+                raise ValueError("TronGrid transaction data must be a list of objects")
+            records.extend(page[: MAX_RECORDS_PER_ADDRESS - len(records)])
+            if not page or len(records) >= MAX_RECORDS_PER_ADDRESS:
+                break
+            meta = response.get("meta", {})
+            if not isinstance(meta, dict):
+                raise ValueError("TronGrid pagination metadata must be an object")
+            fingerprint = meta.get("fingerprint")
+            if fingerprint is None:
+                break
+            if not isinstance(fingerprint, str):
+                raise ValueError("TronGrid fingerprint must be a string")
+            if not fingerprint:
+                break
+            if fingerprint in seen:
+                break
+            seen.add(fingerprint)
+            params["fingerprint"] = fingerprint
+        return records
