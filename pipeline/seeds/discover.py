@@ -6,7 +6,10 @@ import asyncio
 import time
 
 from pipeline.api.client import PAGE_SIZE, USDT_CONTRACT, TronGridClient
-from pipeline.utils.address import normalize_address
+from pipeline.seeds.blacklist import load_local_blacklist
+from pipeline.seeds.verify import verify_licit
+from pipeline.utils.address import normalize_address, to_hex
+from pipeline.utils.timeutils import now_iso
 
 
 async def discover_candidates(
@@ -98,3 +101,81 @@ async def discover_candidates(
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     return candidates
+
+
+async def fetch_licit_seeds(
+    client: TronGridClient,
+    target: int,
+    concurrency: int = 10,
+    *,
+    blacklist_paths: list[str] | None = None,
+) -> list[dict]:
+    """Return exactly target unique verified seed rows, or raise RuntimeError.
+
+    concurrency is the verification limit per pooled key (one worker group in
+    public mode). Optional blacklist_paths supplies local CSV blacklists.
+    Discovery budgets grow when candidates are rejected; already checked
+    addresses are not verified again. All unfinished probes are cancelled and
+    awaited on success, failure or cancellation. This function writes no CSVs.
+    """
+    if isinstance(target, bool) or not isinstance(target, int) or target < 0:
+        raise ValueError("target must be a nonnegative integer")
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+        raise ValueError("concurrency must be a positive integer")
+    if target == 0:
+        return []
+
+    blacklist = load_local_blacklist(blacklist_paths or [])
+    workers = concurrency * max(1, len(client.pool.keys))
+    candidate_target = max(target, workers)
+    seen: set[str] = set()
+    verified: list[str] = []
+    while len(verified) < target:
+        candidates = await discover_candidates(client, candidate_target)
+        fresh = iter(sorted(candidates - seen))
+        seen.update(candidates)
+        pending: dict[asyncio.Task, str] = {}
+        tasks: list[asyncio.Task] = []
+        try:
+            while True:
+                while len(pending) < workers:
+                    address = next(fresh, None)
+                    if address is None:
+                        break
+                    task = asyncio.create_task(verify_licit(client, address, blacklist))
+                    pending[task] = address
+                    tasks.append(task)
+                if not pending:
+                    break
+                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    address = pending.pop(task)
+                    if task.result() and len(verified) < target:
+                        verified.append(address)
+                if len(verified) >= target:
+                    break
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if len(verified) >= target:
+            break
+        if len(candidates) < candidate_target:
+            raise RuntimeError(
+                f"Requested {target} verified seeds, found {len(verified)} before discovery exhausted"
+            )
+        candidate_target *= 2
+
+    timestamp = now_iso()
+    return [
+        {
+            "wallet_address": address,
+            "hex_address": to_hex(address),
+            "transaction_id": "",
+            "source_name": "TronGrid_Licit_USDT",
+            "label": "0",
+            "created_at": timestamp,
+        }
+        for address in sorted(verified)
+    ]
