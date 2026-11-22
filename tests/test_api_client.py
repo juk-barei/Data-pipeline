@@ -430,3 +430,73 @@ def test_recent_usdt_events_stop_without_progress(mock_client, payload, expected
 def test_recent_usdt_events_reject_malformed_response(mock_client, payload):
     with pytest.raises(ValueError):
         asyncio.run(mock_client(lambda request: httpx.Response(200, json=payload)).get_recent_usdt_transfers(10))
+
+
+@pytest.mark.parametrize("banned", [False, True])
+def test_blacklist_constant_call_encodes_abi_and_decodes_bool(mock_client, banned):
+    import json
+    from pipeline.api.client import USDT_CONTRACT
+    from pipeline.utils.address import to_hex
+
+    address = "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb"
+
+    def handler(request):
+        assert request.url.path == "/wallet/triggerconstantcontract"
+        assert request.method == "POST"
+        body = json.loads(request.content)
+        assert body == {
+            "owner_address": to_hex(address),
+            "contract_address": to_hex(USDT_CONTRACT),
+            "function_selector": "isBlackListed(address)",
+            "parameter": "0" * 64,
+            "visible": False,
+        }
+        return httpx.Response(200, json={"result": {"result": True}, "constant_result": [f"{int(banned):064x}"]})
+
+    assert asyncio.run(mock_client(handler).call_is_blacklisted(address)) is banned
+
+
+def test_blacklist_normalizes_hex_input(mock_client):
+    from pipeline.utils.address import to_hex
+
+    address = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+
+    def handler(request):
+        import json
+        body = json.loads(request.content)
+        assert body["parameter"] == to_hex(address)[2:].rjust(64, "0")
+        return httpx.Response(200, json={"result": {"result": True}, "constant_result": ["0"*63 + "1"]})
+
+    assert asyncio.run(mock_client(handler).call_is_blacklisted(to_hex(address))) is True
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"constant_result": ["0"*63+"1"]},
+    {"result": {"result": False}, "constant_result": ["0"*63+"1"]},
+    {"result": {"result": True}},
+    *[{"result": {"result": True}, "constant_result": value} for value in [None, [], "01", [None], ["01"], ["z"*64], ["0"*63+"2"]]],
+])
+def test_blacklist_unknown_and_malformed_results_are_false(mock_client, payload):
+    client = mock_client(lambda request: httpx.Response(200, json=payload))
+    assert asyncio.run(client.call_is_blacklisted("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")) is False
+
+
+def test_blacklist_network_errors_default_false_and_log_without_secrets(mock_client, caplog):
+    handler = Mock(side_effect=httpx.ConnectError("private-api-key"))
+    client = mock_client(handler)
+    assert asyncio.run(client.call_is_blacklisted("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")) is False
+    assert handler.call_count == 3
+    assert "ConnectError" in caplog.text
+    assert "private-api-key" not in caplog.text
+
+
+def test_blacklist_invalid_address_does_not_request(mock_client):
+    handler = Mock()
+    assert asyncio.run(mock_client(handler).call_is_blacklisted("invalid")) is False
+    assert handler.call_count == 0
+
+
+def test_blacklist_cancellation_propagates(mock_client):
+    handler = Mock(side_effect=asyncio.CancelledError)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(mock_client(handler).call_is_blacklisted("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"))

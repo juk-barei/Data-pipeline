@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from urllib.parse import quote
 
@@ -9,7 +10,10 @@ import httpx
 
 from pipeline.api.keypool import MultiKeyPool
 from pipeline.utils.async_utils import async_retry
+from pipeline.utils.address import normalize_address, to_hex
 
+
+logger = logging.getLogger(__name__)
 
 MAX_RECORDS_PER_ADDRESS = 10_000
 PAGE_SIZE = 200
@@ -196,3 +200,39 @@ class TronGridClient:
             seen.add(fingerprint)
             params["fingerprint"] = fingerprint
         return records
+
+
+    async def call_is_blacklisted(self, address: str) -> bool:
+        """Read Tether's blacklist flag; unavailable or invalid results are False."""
+        canonical = normalize_address(address)
+        if not canonical:
+            return False
+        hex_address = to_hex(canonical)
+        try:
+            response = await self._request(
+                "/wallet/triggerconstantcontract",
+                method="POST",
+                json={
+                    "owner_address": hex_address,
+                    "contract_address": to_hex(USDT_CONTRACT),
+                    "function_selector": "isBlackListed(address)",
+                    # ABI addresses omit TRON's 41 network prefix.
+                    "parameter": hex_address[2:].rjust(64, "0"),
+                    "visible": False,
+                },
+            )
+            status = response.get("result", {})
+            if not isinstance(status, dict) or status.get("result") is not True:
+                return False
+            values = response.get("constant_result")
+            if not isinstance(values, list) or not values:
+                return False
+            word = values[0]
+            if not isinstance(word, str) or len(word) != 64:
+                return False
+            if any(char not in "0123456789abcdefABCDEF" for char in word):
+                return False
+            return int(word, 16) == 1
+        except Exception as exc:
+            logger.warning("Blacklist query failed for %s (%s)", canonical, type(exc).__name__)
+            return False
