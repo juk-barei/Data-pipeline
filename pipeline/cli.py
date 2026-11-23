@@ -1,9 +1,18 @@
-﻿"""Command-line entry points for the CSV pipeline."""
+"""Command-line entry points for the CSV pipeline."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
+
+from pipeline.api.client import TronGridClient
+from pipeline.api.keypool import MultiKeyPool
+from pipeline.config import Settings, load_env, load_settings
+from pipeline.seeds.discover import fetch_licit_seeds
+from pipeline.storage.csv_store import CSVStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,3 +40,38 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--dry-run", action="store_true", help="Preview upload without changing files")
             command.add_argument("--delete-local", action="store_true", help="Delete uploaded files after success")
     return parser
+
+
+def _settings(args: argparse.Namespace) -> Settings:
+    """Resolve environment settings once, with an optional CLI directory override."""
+    settings = getattr(args, "settings", None)
+    if settings is None:
+        load_env(getattr(args, "env_file", None))
+        settings = load_settings()
+    directory = getattr(args, "csv_dir", None)
+    return replace(settings, csv_dir=directory) if directory is not None else settings
+
+
+@asynccontextmanager
+async def _client(settings: Settings):
+    """Keep HTTP creation and cleanup on the command's event loop."""
+    pool = MultiKeyPool(list(settings.api_keys), settings.cooldown_sec, settings.rate_limit_per_key)
+    client = TronGridClient(pool, base_url="https://api.trongrid.io", timeout=30.0)
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+def cmd_fetch_seeds(args: argparse.Namespace) -> int:
+    """Discover verified rows and register them using idempotent store insertion."""
+    settings = _settings(args)
+    store = CSVStore(str(settings.csv_dir))
+
+    async def fetch() -> None:
+        async with _client(settings) as client:
+            seeds = await fetch_licit_seeds(client, settings.seed_count)
+            store.insert_seeds(seeds)
+
+    asyncio.run(fetch())
+    return 0
