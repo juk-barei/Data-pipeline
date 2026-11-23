@@ -6,6 +6,7 @@ import asyncio
 import math
 
 from pipeline.api.client import USDT_CONTRACT, TronGridClient
+from pipeline.api.parsers import parse_account, parse_trc20_transfer, parse_trx_transaction
 from pipeline.config import Settings
 from pipeline.storage.csv_store import CSVStore
 
@@ -59,3 +60,38 @@ class CrawlerWorker:
                 if isinstance(result, asyncio.CancelledError):
                     raise result
             return (address, *results)
+
+    def _normalize(self, raw_account, raw_trx, raw_trc20) -> tuple:
+        """Keep usable partial data, but mark synced only if all requests succeeded.
+
+        A missing account (None) is a successful unknown-account response.
+        Parsers may intentionally drop non-transfer or unusable transactions.
+        Transaction identity follows CSVStore's first-row-wins tx_hash key.
+        """
+        synced = True
+        account_row = {}
+        if isinstance(raw_account, dict):
+            account_row = parse_account(raw_account)
+            if not account_row:
+                synced = False
+        elif raw_account is not None:
+            synced = False
+
+        tx_rows = []
+        seen = set()
+        for payload, parser in (
+            (raw_trx, parse_trx_transaction),
+            (raw_trc20, parse_trc20_transfer),
+        ):
+            if not isinstance(payload, list):
+                synced = False
+                continue
+            for raw in payload:
+                if not isinstance(raw, dict):
+                    synced = False
+                    continue
+                row = parser(raw)
+                if row is not None and row["tx_hash"] not in seen:
+                    seen.add(row["tx_hash"])
+                    tx_rows.append(row)
+        return account_row, tx_rows, synced

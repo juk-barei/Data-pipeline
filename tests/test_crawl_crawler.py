@@ -11,6 +11,7 @@ from pipeline.api.keypool import MultiKeyPool
 from pipeline.config import Settings
 from pipeline.crawl.crawler import CrawlerWorker
 from pipeline.utils.async_utils import async_retry
+from pipeline.utils.address import to_hex
 
 ADDRESS = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 OTHER = "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb"
@@ -173,3 +174,64 @@ def test_fetch_wallet_cancellation_drains_requests_and_releases_permit():
         assert not worker.semaphore.locked()
 
     asyncio.run(check())
+
+
+@pytest.fixture
+def raw_histories():
+    return (
+        {"address": ADDRESS, "create_time": 1700000000000,
+         "latest_opration_time": 1700000060000},
+        [{"txID": "native", "block_timestamp": 1700000000000,
+          "raw_data": {"contract": [{"type": "TransferContract", "parameter": {
+              "value": {"owner_address": to_hex(ADDRESS),
+                        "to_address": to_hex(OTHER), "amount": 1234567}
+          }}]}}],
+        [{"transaction_id": "token", "block_timestamp": 1700000000000,
+          "from": OTHER, "to": ADDRESS, "value": "1000001",
+          "token_info": {"address": USDT_CONTRACT, "decimals": 6, "symbol": "USDT"}}],
+    )
+
+
+def test_normalize_uses_parsers_and_deduplicates_transactions(raw_histories):
+    account, native, tokens = raw_histories
+    row, txs, synced = make_worker()._normalize(account, native * 2, tokens * 2)
+    assert synced is True
+    assert row["address"] == ADDRESS
+    assert row["last_seen_timestamp"] == "2023-11-14T22:14:20Z"
+    assert [(tx["tx_hash"], tx["amount"]) for tx in txs] == [
+        ("native", "1.234567"), ("token", "1.000001")
+    ]
+    assert txs[0]["from_address"] == ADDRESS
+    assert txs[1]["from_address"] == OTHER
+
+
+@pytest.mark.parametrize("slot", [0, 1, 2])
+@pytest.mark.parametrize("failure", [httpx.ConnectError("offline"),
+                                         RuntimeError("throttled")])
+def test_normalize_preserves_partial_data_but_not_synced(raw_histories, slot, failure):
+    raw = list(raw_histories)
+    raw[slot] = failure
+    row, txs, synced = make_worker()._normalize(*raw)
+    assert synced is False
+    assert bool(row) is (slot != 0)
+    assert {tx["tx_hash"] for tx in txs} == (
+        {"native", "token"} if slot == 0 else {"token"} if slot == 1 else {"native"}
+    )
+
+
+def test_normalize_unknown_account_and_empty_histories_are_successful():
+    assert make_worker()._normalize(None, [], []) == ({}, [], True)
+
+
+@pytest.mark.parametrize("raw", [([], [], []), ({}, [], []),
+                                      (None, None, []), (None, [], {}),
+                                      (None, [None], [])])
+def test_normalize_malformed_response_cannot_mark_synced(raw):
+    assert make_worker()._normalize(*raw)[2] is False
+
+
+def test_normalize_skips_nontransfer_and_missing_identity_records(raw_histories):
+    account, native, tokens = raw_histories
+    native[0]["raw_data"]["contract"][0]["type"] = "TriggerSmartContract"
+    tokens[0].pop("transaction_id")
+    assert make_worker()._normalize(account, native, tokens)[1:] == ([], True)
