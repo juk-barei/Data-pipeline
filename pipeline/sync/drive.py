@@ -14,3 +14,13 @@ def ensure_rclone() -> str:
             "and configure a remote with 'rclone config'."
         )
     return executable
+
+
+def build_dest(remote: str, remote_path: str) -> str:
+    """Compose a configured remote and a root-relative remote directory."""
+    name = remote.strip().removesuffix(":")
+    if not name or any(character in name for character in ":/\\\r\n") or name.startswith("-"):
+        raise ValueError("remote must be a configured rclone remote name")
+    if "\x00" in remote_path or "\x00" in name:
+        raise ValueError("rclone destination cannot contain a null character")
+    return f"{name}:{remote_path.strip('/')}"
