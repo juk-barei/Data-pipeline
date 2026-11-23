@@ -33,6 +33,8 @@ class MultiKeyPool:
         self._next_allowed = dict.fromkeys(self.keys, 0.0)
         self._index = 0
         self._lock = asyncio.Lock()
+        # Cumulative acquisitions, including public mode and retry attempts.
+        self.acquisitions = 0
         if not self.keys:
             logger.warning("No API keys configured; using public mode")
 
@@ -40,6 +42,7 @@ class MultiKeyPool:
     async def get_key(self) -> str:
         """Acquire the next eligible key, yielding while every key is busy."""
         if not self.keys:
+            self.acquisitions += 1
             return ""
         while True:
             async with self._lock:
@@ -55,6 +58,7 @@ class MultiKeyPool:
                     if ready_at <= now:
                         self._next_allowed[key] = now + self._interval
                         self._index = (index + 1) % len(self.keys)
+                        self.acquisitions += 1
                         return key
                     earliest = min(earliest, ready_at)
                 delay = earliest - now

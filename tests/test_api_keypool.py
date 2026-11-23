@@ -6,6 +6,32 @@ import pytest
 from pipeline.api.keypool import MultiKeyPool
 
 
+def test_acquisition_counter_counts_returned_keys_and_public_attempts():
+    async def check():
+        keyed = MultiKeyPool(["one", "two"], 60)
+        public = MultiKeyPool([], 60)
+        assert keyed.acquisitions == public.acquisitions == 0
+        assert await keyed.get_key() == "one"
+        assert await keyed.get_key() == "two"
+        assert await public.get_key() == ""
+        assert keyed.acquisitions == 2
+        assert public.acquisitions == 1
+    asyncio.run(check())
+
+
+def test_cancelled_acquisition_does_not_increment_counter():
+    async def check():
+        pool = MultiKeyPool(["one"], 60)
+        pool.penalize("one")
+        task = asyncio.create_task(pool.get_key())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert pool.acquisitions == 0
+    asyncio.run(check())
+
+
 def test_pool_initializes_independent_per_key_pacers():
     keys = ["one", "two", "one"]
     pool = MultiKeyPool(keys, 60)
