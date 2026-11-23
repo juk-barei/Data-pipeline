@@ -8,6 +8,8 @@ from unittest.mock import Mock
 import pytest
 
 from pipeline.sync import drive
+from pipeline.config import Settings
+from pipeline.storage.csv_store import CSVStore
 
 
 @pytest.fixture(autouse=True)
@@ -310,3 +312,90 @@ def test_delete_local_preflights_entire_request_before_deleting_any(tmp_path, mo
 
 def test_delete_local_empty_request_is_noop():
     assert drive.delete_local([]) is None
+
+
+def test_maybe_sync_disabled_does_not_read_store_or_touch_state(monkeypatch):
+    sync = Mock()
+    monkeypatch.setattr(drive, "sync_to_drive", sync)
+    state = {"untouched": 123}
+    assert drive.maybe_sync(object(), Settings(sync_every=0), state) is False
+    assert state == {"untouched": 123}
+    sync.assert_not_called()
+
+
+def test_maybe_sync_cycle_threshold_and_success_reset(tmp_path, monkeypatch):
+    store = CSVStore(tmp_path)
+    settings = Settings(sync_every=3, drive_remote="drive", drive_path="data")
+    state = {}
+    sync = Mock(return_value=0)
+    monkeypatch.setattr(drive, "sync_to_drive", sync)
+    assert drive.maybe_sync(store, settings, state) is False
+    assert drive.maybe_sync(store, settings, state) is False
+    sync.assert_not_called()
+    assert drive.maybe_sync(store, settings, state) is True
+    sync.assert_called_once_with(store.csv_dir, "drive", "data")
+    assert state == {"last_appended": 0, "pending_rows": 0, "cycles_since_sync": 0}
+    assert drive.maybe_sync(store, settings, state) is False
+    assert sync.call_count == 1
+
+
+def test_maybe_sync_row_threshold_survives_compaction(tmp_path, monkeypatch):
+    store = CSVStore(tmp_path)
+    settings = Settings(sync_every=5, drive_remote="drive")
+    state = {}
+    sync = Mock(return_value=0)
+    monkeypatch.setattr(drive, "sync_to_drive", sync)
+    store.insert_seeds([{"wallet_address": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"}])
+    assert store.appended_rows == 3
+    assert drive.maybe_sync(store, settings, state) is False
+    store.compact()
+    assert store._appended_since_compact == 0
+    assert store.appended_rows == 3
+    store.upsert_crawled_data([], [], ["TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"], [])
+    assert drive.maybe_sync(store, settings, state) is False
+    store.add_expansion_results([], [], [], ["TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"])
+    assert store.appended_rows == 5
+    assert drive.maybe_sync(store, settings, state) is True
+    sync.assert_called_once()
+    assert store.appended_rows == 5
+    assert state["pending_rows"] == 0
+
+
+def test_maybe_sync_failed_upload_retries_without_double_counting_rows(tmp_path, monkeypatch, caplog):
+    store = SimpleNamespace(csv_dir=tmp_path, appended_rows=5)
+    settings = Settings(sync_every=5, drive_remote="drive")
+    state = {}
+    sync = Mock(side_effect=[7, 0])
+    monkeypatch.setattr(drive, "sync_to_drive", sync)
+    assert drive.maybe_sync(store, settings, state) is False
+    assert state == {"last_appended": 5, "pending_rows": 5, "cycles_since_sync": 1}
+    assert "exit code 7" in caplog.text
+    store.appended_rows = 6
+    assert drive.maybe_sync(store, settings, state) is True
+    assert sync.call_count == 2
+    assert state == {"last_appended": 6, "pending_rows": 0, "cycles_since_sync": 0}
+
+
+def test_maybe_sync_exception_preserves_cadence_for_retry(tmp_path, monkeypatch):
+    store = SimpleNamespace(csv_dir=tmp_path, appended_rows=2)
+    settings = Settings(sync_every=2)
+    state = {}
+    sync = Mock(side_effect=[OSError("offline"), 0])
+    monkeypatch.setattr(drive, "sync_to_drive", sync)
+    with pytest.raises(OSError, match="offline"):
+        drive.maybe_sync(store, settings, state)
+    assert state["pending_rows"] == 2
+    assert drive.maybe_sync(store, settings, state) is True
+    assert sync.call_count == 2
+
+
+@pytest.mark.parametrize("threshold", [-1, True, 1.5])
+def test_maybe_sync_rejects_invalid_threshold(threshold):
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        drive.maybe_sync(object(), Settings(sync_every=threshold), {})
+
+
+def test_maybe_sync_rejects_state_from_reset_counter(tmp_path):
+    store = SimpleNamespace(csv_dir=tmp_path, appended_rows=0)
+    with pytest.raises(ValueError, match="same store"):
+        drive.maybe_sync(store, Settings(), {"last_appended": 5})

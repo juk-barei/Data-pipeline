@@ -5,11 +5,17 @@ from __future__ import annotations
 import csv
 import gzip
 import hashlib
+import logging
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+
+from pipeline.config import Settings
+from pipeline.storage.csv_store import CSVStore
+
+logger = logging.getLogger(__name__)
 
 
 # Receipts authorize only unchanged files from this process's successful upload.
@@ -196,3 +202,36 @@ def delete_local(files: list[Path]) -> None:
             raise ValueError(f"File changed before deletion: {path.name}")
         path.unlink()
         del _confirmed_uploads[path]
+
+
+def maybe_sync(store: CSVStore, settings: Settings, state: dict[str, int]) -> bool:
+    """Sync after a row or cycle threshold, retaining failed work for retry.
+
+    ``state`` belongs to one runner/store for its lifetime. Calls must be
+    serialized with that store's writes (including when called via to_thread).
+    Counters represent completed appends since construction; on success only
+    cadence resets, while the store's append counter stays monotonic. False
+    means disabled, below threshold, or a nonzero rclone exit; process/IO errors
+    propagate with cadence retained so a caller can retry after resolving them.
+    """
+    threshold = settings.sync_every
+    if type(threshold) is not int or threshold < 0:
+        raise ValueError("sync_every must be a nonnegative integer")
+    if threshold == 0:
+        return False
+    appended = store.appended_rows
+    previous = state.get("last_appended", 0)
+    if appended < previous:
+        raise ValueError("Sync state must belong to the same store instance")
+    state["last_appended"] = appended
+    state["pending_rows"] = state.get("pending_rows", 0) + appended - previous
+    state["cycles_since_sync"] = state.get("cycles_since_sync", 0) + 1
+    if max(state["pending_rows"], state["cycles_since_sync"]) < threshold:
+        return False
+    code = sync_to_drive(store.csv_dir, settings.drive_remote, settings.drive_path)
+    if code != 0:
+        logger.warning("Drive sync failed with exit code %s; keeping cadence for retry", code)
+        return False
+    state["pending_rows"] = 0
+    state["cycles_since_sync"] = 0
+    return True

@@ -68,7 +68,7 @@ def load_settings() -> Settings:
         max_concurrency=_get_int("MAX_CONCURRENCY", 20),
         drive_remote=os.getenv("DRIVE_REMOTE", "").strip(),
         drive_path=os.getenv("DRIVE_PATH", "").strip(),
-        sync_every=_get_int("SYNC_EVERY", 10),
+        sync_every=_get_int("SYNC_EVERY", 10, minimum=0),
     )
 
 
