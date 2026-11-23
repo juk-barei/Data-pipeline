@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 
-from pipeline.api.client import TronGridClient
+from pipeline.api.client import USDT_CONTRACT, TronGridClient
 from pipeline.config import Settings
 from pipeline.storage.csv_store import CSVStore
 
@@ -40,3 +40,22 @@ class CrawlerWorker:
         self.settings = settings
         self.max_concurrency = max_concurrency
         self.semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def _fetch_wallet(self, address: str) -> tuple:
+        """Fetch three histories independently; retain failures for normalization.
+
+        The client acquires a pooled key for every request/page and handles 429
+        penalties and retries. Holding one permit bounds whole-wallet work.
+        Cancellation remains a control signal, rather than a failed result.
+        """
+        async with self.semaphore:
+            results = await asyncio.gather(
+                self.client.get_account(address),
+                self.client.get_trx_transactions(address),
+                self.client.get_trc20_transfers(address, USDT_CONTRACT),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+            return (address, *results)
