@@ -1,6 +1,8 @@
 import pytest
+from unittest.mock import Mock
 
-from pipeline.orchestrate.health import is_complete
+from pipeline.api.keypool import MultiKeyPool
+from pipeline.orchestrate.health import HealthReporter, is_complete
 from pipeline.storage.csv_store import CSVStore
 
 
@@ -27,3 +29,15 @@ def test_completion_matches_store_metrics_through_wallet_lifecycle(tmp_path):
         update()
         metrics = store.get_metrics()
         assert is_complete(metrics) is metrics["is_complete"]
+
+
+def test_reporter_constructor_retains_optional_dependencies_without_io():
+    store = Mock()
+    pool = MultiKeyPool(["secret-key"], 60)
+    reporter = HealthReporter(store, pool)
+    assert reporter.store is store
+    assert reporter.key_pool is pool
+    assert store.mock_calls == []
+    assert not pool._lock.locked()
+    assert pool.cooldown.cooldowns == {}
+    assert HealthReporter(store).key_pool is None
