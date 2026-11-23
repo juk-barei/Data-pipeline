@@ -1,3 +1,5 @@
+import gzip
+
 import pytest
 
 from pipeline.sync import drive
@@ -40,3 +42,47 @@ def test_build_dest_rejects_invalid_remote_names(remote):
 def test_build_dest_rejects_null_path():
     with pytest.raises(ValueError, match="null"):
         drive.build_dest("drive", "bad\x00path")
+
+
+def test_gzip_streams_compressible_csv_and_preserves_source(tmp_path, monkeypatch):
+    source = tmp_path / "transactions.csv"
+    content = b"address,amount\n" + b"wallet,123456789\n" * 100_000
+    source.write_bytes(content)
+    original_copy = drive.shutil.copyfileobj
+    chunks = []
+
+    def copy_bounded(reader, writer, length):
+        chunks.append(length)
+        return original_copy(reader, writer, length)
+
+    monkeypatch.setattr(drive.shutil, "copyfileobj", copy_bounded)
+    result = drive.compress_gzip(source)
+    assert result == source.with_suffix(".csv.gz")
+    assert gzip.decompress(result.read_bytes()) == content
+    assert result.stat().st_size < len(content) / 10
+    assert source.read_bytes() == content
+    assert chunks == [1024 * 1024]
+    previous = result.read_bytes()
+    assert drive.compress_gzip(source).read_bytes() == previous
+
+
+def test_gzip_failure_preserves_existing_export_and_cleans_temp(tmp_path, monkeypatch):
+    source = tmp_path / "accounts.csv"
+    source.write_text("address\nwallet\n", encoding="utf-8")
+    destination = source.with_suffix(".csv.gz")
+    destination.write_bytes(b"previous export")
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(drive.shutil, "copyfileobj", fail)
+    with pytest.raises(OSError, match="disk full"):
+        drive.compress_gzip(source)
+    assert destination.read_bytes() == b"previous export"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["accounts.csv", "accounts.csv.gz"]
+
+
+def test_gzip_empty_input_roundtrips(tmp_path):
+    source = tmp_path / "empty.csv"
+    source.write_bytes(b"")
+    assert gzip.decompress(drive.compress_gzip(source).read_bytes()) == b""
