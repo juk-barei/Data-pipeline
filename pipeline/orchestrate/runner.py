@@ -30,3 +30,14 @@ class Runner:
         self._cycle_lock = asyncio.Lock()
         self._run_lock = asyncio.Lock()
         self._sync_state: dict = {}
+
+    async def run_once(self) -> dict:
+        """Run crawl then expansion, retaining each worker's named counters.
+
+        Serializing complete cycles prevents overlapping claims on this runner.
+        Worker exceptions and cancellation propagate after worker cleanup.
+        """
+        async with self._cycle_lock:
+            crawl = await self.crawler.run_batch()
+            expand = await self.expander.run_batch()
+            return {"crawl": crawl, "expand": expand}
