@@ -14,14 +14,14 @@ import tempfile
 
 import httpx
 
-from pipeline.api.client import TronGridClient
+from pipeline.api.client import TronGridClient, wait_for_api
 from pipeline.api.keypool import MultiKeyPool
-from pipeline.config import Settings, load_env, load_settings, setup_logging
+from pipeline.config import Settings, load_env, load_settings, setup_logging, validate_config
 from pipeline.orchestrate.health import HealthReporter
 from pipeline.orchestrate.runner import Runner
 from pipeline.seeds.discover import fetch_licit_seeds
 from pipeline.storage.csv_store import CSVStore
-from pipeline.sync.drive import compress_gzip, delete_local, sync_to_drive
+from pipeline.sync.drive import check_dependencies, compress_gzip, delete_local, sync_to_drive
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,10 +75,14 @@ async def _client(settings: Settings):
 def cmd_fetch_seeds(args: argparse.Namespace) -> int:
     """Discover verified rows and register them using idempotent store insertion."""
     settings = _settings(args)
+    errors = validate_config(replace(settings, sync_every=0))
+    if errors:
+        raise ValueError("; ".join(errors))
     store = CSVStore(str(settings.csv_dir))
 
     async def fetch() -> None:
         async with _client(settings) as client:
+            await wait_for_api(client)
             seeds = await fetch_licit_seeds(client, settings.seed_count)
             store.insert_seeds(seeds)
 
@@ -89,10 +93,16 @@ def cmd_fetch_seeds(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     """Run one cycle or the orchestration loop, closing HTTP on interruption."""
     settings = _settings(args)
+    errors = validate_config(replace(settings, sync_every=0) if args.step else settings)
+    if errors:
+        raise ValueError("; ".join(errors))
+    if not args.step and settings.sync_every > 0:
+        check_dependencies(settings)
     store = CSVStore(str(settings.csv_dir))
 
     async def run() -> None:
         async with _client(settings) as client:
+            await wait_for_api(client)
             runner = Runner(store, client, settings)
             if args.step:
                 await runner.run_once()

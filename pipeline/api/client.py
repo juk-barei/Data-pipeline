@@ -236,3 +236,27 @@ class TronGridClient:
         except Exception as exc:
             logger.warning("Blacklist query failed for %s (%s)", canonical, type(exc).__name__)
             return False
+
+
+async def wait_for_api(client: TronGridClient, attempts: int = 3) -> None:
+    """Probe the current block through the authenticated, paced client.
+
+    ``attempts`` bounds probe calls; each uses the client's existing bounded
+    transport retries. Cancellation propagates immediately. The caller owns
+    the client and must close it even when this startup check fails.
+    """
+    if type(attempts) is not int or attempts < 1:
+        raise ValueError("attempts must be a positive integer")
+    for attempt in range(attempts):
+        try:
+            response = await client._request("/wallet/getnowblock", method="POST", json={})
+            if not isinstance(response.get("blockID"), str) or not response["blockID"]:
+                raise ValueError("TronGrid startup probe returned no block ID")
+            return
+        except Exception:
+            if attempt == attempts - 1:
+                # Transport exceptions may include sensitive URLs/headers.
+                raise RuntimeError(
+                    f"TronGrid startup probe failed after {attempts} attempts; "
+                    "check API keys and network access."
+                ) from None
