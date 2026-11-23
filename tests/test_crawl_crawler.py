@@ -235,3 +235,29 @@ def test_normalize_skips_nontransfer_and_missing_identity_records(raw_histories)
     native[0]["raw_data"]["contract"][0]["type"] = "TriggerSmartContract"
     tokens[0].pop("transaction_id")
     assert make_worker()._normalize(account, native, tokens)[1:] == ([], True)
+
+
+def test_detect_supernodes_counts_unique_transactions_and_includes_boundary():
+    worker = make_worker(settings=Settings(supernode_threshold=2))
+    shared = {"tx_hash": "shared", "from_address": ADDRESS, "to_address": OTHER}
+    rows = [shared, dict(shared),
+            {"tx_hash": "self", "from_address": ADDRESS, "to_address": ADDRESS},
+            {"tx_hash": "outside", "from_address": "unclaimed", "to_address": "unclaimed"}]
+    assert worker._detect_supernodes(rows, [ADDRESS, OTHER, ADDRESS]) == [ADDRESS]
+    assert make_worker(settings=Settings(supernode_threshold=1))._detect_supernodes(
+        rows, [ADDRESS, OTHER]
+    ) == [ADDRESS, OTHER]
+    assert make_worker(settings=Settings(supernode_threshold=3))._detect_supernodes(
+        rows, [ADDRESS, OTHER]
+    ) == []
+
+
+def test_detect_supernodes_handles_empty_batch_and_missing_transaction_hash():
+    worker = make_worker(settings=Settings(supernode_threshold=1))
+    assert worker._detect_supernodes([], [ADDRESS]) == []
+    assert worker._detect_supernodes([
+        {"from_address": ADDRESS, "to_address": OTHER}
+    ], [ADDRESS]) == []
+    assert worker._detect_supernodes([
+        {"tx_hash": "outside", "from_address": OTHER, "to_address": OTHER}
+    ], []) == []

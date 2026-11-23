@@ -95,3 +95,20 @@ class CrawlerWorker:
                     seen.add(row["tx_hash"])
                     tx_rows.append(row)
         return account_row, tx_rows, synced
+
+    def _detect_supernodes(self, tx_rows, addresses) -> list[str]:
+        """Flag batch wallets touching at least the configured number of txs.
+
+        Count unique transaction hashes per address, including a self-transfer
+        once. The same transaction can appear in several fetched histories.
+        """
+        counts = {address: set() for address in addresses}
+        for row in tx_rows:
+            tx_hash = row.get("tx_hash")
+            if not tx_hash:
+                continue
+            for address in {row.get("from_address"), row.get("to_address")}:
+                if address in counts:
+                    counts[address].add(tx_hash)
+        return [address for address, hashes in counts.items()
+                if len(hashes) >= self.settings.supernode_threshold]
