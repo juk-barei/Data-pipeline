@@ -1,9 +1,19 @@
 import gzip
 import builtins
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from pipeline.sync import drive
+
+
+@pytest.fixture(autouse=True)
+def clear_sync_receipts():
+    drive._confirmed_uploads.clear()
+    yield
+    drive._confirmed_uploads.clear()
 
 
 def test_ensure_rclone_returns_resolved_executable_without_running_it(monkeypatch):
@@ -151,3 +161,94 @@ def test_parquet_missing_optional_dependency_has_install_hint(tmp_path, monkeypa
     monkeypatch.setattr(builtins, "__import__", without_arrow)
     with pytest.raises(ImportError, match=r"tron-data-pipeline\[parquet\]"):
         drive.csv_to_parquet(tmp_path / "unused.csv")
+
+
+def test_sync_copies_stable_snapshots_with_checksum_and_preserves_sources(tmp_path, monkeypatch):
+    source = tmp_path / "accounts.csv"
+    source.write_bytes(b"address\nwallet\n")
+    exported = tmp_path / "accounts.csv.gz"
+    exported.write_bytes(b"gzip export")
+    (tmp_path / ".env").write_text("secret", encoding="utf-8")
+    observed = []
+    monkeypatch.setattr(drive, "ensure_rclone", lambda: "rclone executable")
+
+    def run(command, *, check, timeout):
+        assert command[:4] == ["rclone executable", "copy", "--checksum", "--"]
+        assert command[-1] == "drive:data with spaces"
+        assert check is False and timeout == 300
+        snapshot = Path(command[-2])
+        assert snapshot != tmp_path
+        assert sorted(path.name for path in snapshot.iterdir()) == ["accounts.csv", "accounts.csv.gz"]
+        assert (snapshot / source.name).read_bytes() == source.read_bytes()
+        assert (snapshot / source.name).stat().st_mtime_ns == source.stat().st_mtime_ns
+        observed.append(snapshot)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(drive.subprocess, "run", run)
+    assert drive.sync_to_drive(tmp_path, "drive", "/data with spaces/") == 0
+    assert source.read_bytes() == b"address\nwallet\n"
+    assert not observed[0].exists()
+    assert source.resolve() in drive._confirmed_uploads
+    assert exported.resolve() in drive._confirmed_uploads
+
+
+@pytest.mark.parametrize("code,dry_run", [(7, False), (0, True)])
+def test_failed_or_dry_sync_does_not_authorize_deletion(tmp_path, monkeypatch, code, dry_run):
+    source = tmp_path / "accounts.csv"
+    source.write_bytes(b"address\nwallet\n")
+    drive._confirmed_uploads[source.resolve()] = (drive._file_signature(source), "old receipt")
+    monkeypatch.setattr(drive, "ensure_rclone", lambda: "rclone")
+    run = Mock(return_value=SimpleNamespace(returncode=code))
+    monkeypatch.setattr(drive.subprocess, "run", run)
+    assert drive.sync_to_drive(tmp_path, "drive", "", dry_run=dry_run) == code
+    assert ("--dry-run" in run.call_args.args[0]) is dry_run
+    assert drive._confirmed_uploads == {}
+    assert source.exists()
+
+
+def test_changed_source_aborts_before_upload_and_cleans_snapshot(tmp_path, monkeypatch):
+    source = tmp_path / "accounts.csv"
+    source.write_bytes(b"address\nwallet\n")
+    monkeypatch.setattr(drive, "ensure_rclone", lambda: "rclone")
+    original_copy = drive.shutil.copy2
+    snapshots = []
+
+    def copy_then_append(path, target):
+        snapshots.append(target.parent)
+        original_copy(path, target)
+        with path.open("ab") as output:
+            output.write(b"new wallet\n")
+
+    monkeypatch.setattr(drive.shutil, "copy2", copy_then_append)
+    run = Mock()
+    monkeypatch.setattr(drive.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="Dataset changed"):
+        drive.sync_to_drive(tmp_path, "drive", "")
+    run.assert_not_called()
+    assert not snapshots[0].exists()
+    assert drive._confirmed_uploads == {}
+
+
+def test_subprocess_failure_cleans_snapshot_and_preserves_source(tmp_path, monkeypatch):
+    source = tmp_path / "accounts.csv"
+    source.write_bytes(b"address\nwallet\n")
+    monkeypatch.setattr(drive, "ensure_rclone", lambda: "rclone")
+    snapshots = []
+
+    def fail(command, **kwargs):
+        snapshots.append(Path(command[-2]))
+        raise drive.subprocess.TimeoutExpired(command, 300)
+
+    monkeypatch.setattr(drive.subprocess, "run", fail)
+    with pytest.raises(drive.subprocess.TimeoutExpired):
+        drive.sync_to_drive(tmp_path, "drive", "")
+    assert source.exists() and not snapshots[0].exists()
+    assert drive._confirmed_uploads == {}
+
+
+def test_sync_rejects_missing_or_empty_dataset(tmp_path, monkeypatch):
+    monkeypatch.setattr(drive, "ensure_rclone", lambda: "rclone")
+    with pytest.raises(NotADirectoryError):
+        drive.sync_to_drive(tmp_path / "missing", "drive", "")
+    with pytest.raises(ValueError, match="No CSV"):
+        drive.sync_to_drive(tmp_path, "drive", "")

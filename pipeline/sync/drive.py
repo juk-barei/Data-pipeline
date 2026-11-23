@@ -4,10 +4,30 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
+
+
+# Receipts authorize only unchanged files from this process's successful upload.
+# They are intentionally not persisted: a restart requires another real sync.
+_confirmed_uploads: dict[Path, tuple[tuple[int, int, int, int], str]] = {}
+
+
+def _file_signature(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def ensure_rclone() -> str:
@@ -90,3 +110,55 @@ def csv_to_parquet(path: Path) -> Path:
     finally:
         temporary.unlink(missing_ok=True)
     return destination
+
+
+def sync_to_drive(
+    csv_dir: str | Path, remote: str, remote_path: str, dry_run: bool = False,
+) -> int:
+    """Copy stable dataset snapshots, returning rclone's exit code.
+
+    Include top-level CSV, gzip and Parquet exports only. Callers must serialize
+    dataset writes while snapshots are made; detected concurrent changes abort
+    before upload. ``rclone copy --checksum`` leaves unrelated remote files and
+    unchanged content alone. Dry runs never authorize subsequent deletion.
+    """
+    directory = Path(csv_dir).resolve()
+    for uploaded in list(_confirmed_uploads):
+        if uploaded.parent == directory:
+            del _confirmed_uploads[uploaded]
+    destination = build_dest(remote, remote_path)
+    executable = ensure_rclone()
+    if not directory.is_dir():
+        raise NotADirectoryError(directory)
+    files = sorted(
+        path for path in directory.iterdir()
+        if path.name.endswith((".csv", ".csv.gz", ".parquet"))
+    )
+    if not files:
+        raise ValueError("No CSV, gzip, or Parquet dataset files to sync")
+    if any(path.is_symlink() or not path.is_file() for path in files):
+        raise ValueError("Dataset exports must be regular files, not symlinks")
+    signatures = {path: _file_signature(path) for path in files}
+    with tempfile.TemporaryDirectory(prefix="pipeline-sync-") as temporary:
+        snapshot = Path(temporary)
+        receipts = {}
+        for path in files:
+            copy = snapshot / path.name
+            shutil.copy2(path, copy)
+            receipts[path] = (signatures[path], _sha256(copy))
+        current_files = sorted(
+            path for path in directory.iterdir()
+            if path.name.endswith((".csv", ".csv.gz", ".parquet"))
+        )
+        if current_files != files or any(
+            path.is_symlink() or _file_signature(path) != signatures[path] for path in files
+        ):
+            raise RuntimeError("Dataset changed during snapshot; pause writes and retry sync")
+        command = [executable, "copy", "--checksum"]
+        if dry_run:
+            command.append("--dry-run")
+        command.extend(["--", str(snapshot), destination])
+        result = subprocess.run(command, check=False, timeout=300)
+        if result.returncode == 0 and not dry_run:
+            _confirmed_uploads.update(receipts)
+        return result.returncode
