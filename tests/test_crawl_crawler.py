@@ -10,6 +10,7 @@ from pipeline.api.client import USDT_CONTRACT, TronGridClient
 from pipeline.api.keypool import MultiKeyPool
 from pipeline.config import Settings
 from pipeline.crawl.crawler import CrawlerWorker
+from pipeline.storage.csv_store import CSVStore
 from pipeline.utils.async_utils import async_retry
 from pipeline.utils.address import to_hex
 
@@ -261,3 +262,130 @@ def test_detect_supernodes_handles_empty_batch_and_missing_transaction_hash():
     assert worker._detect_supernodes([
         {"tx_hash": "outside", "from_address": OTHER, "to_address": OTHER}
     ], []) == []
+
+
+def test_run_batch_idle_does_not_write():
+    worker = make_worker()
+    worker.store.claim_crawl_batch.return_value = []
+    assert asyncio.run(worker.run_batch()) == dict(
+        claimed=0, synced=0, failed=0, accounts=0, transactions=0, supernodes=0
+    )
+    worker.store.upsert_crawled_data.assert_not_called()
+
+
+def test_run_batch_persists_partial_failure_and_retry_is_idempotent(tmp_path, raw_histories):
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}, {"wallet_address": OTHER}])
+    account, native, tokens = raw_histories
+    failed = True
+
+    async def get_account(address):
+        return {**account, "address": address}
+
+    async def get_tokens(address, contract):
+        if address == ADDRESS and failed:
+            raise httpx.ConnectError("temporary failure")
+        return tokens
+
+    client = SimpleNamespace(pool=MultiKeyPool(["one"], 60),
+                             get_account=get_account,
+                             get_trx_transactions=AsyncMock(return_value=native),
+                             get_trc20_transfers=get_tokens)
+    worker = CrawlerWorker(store, client, Settings(batch_size=2, supernode_threshold=2))
+    first = asyncio.run(worker.run_batch())
+    assert first == dict(claimed=2, synced=1, failed=1, accounts=2, transactions=2, supernodes=2)
+    reopened = CSVStore(str(tmp_path))
+    assert reopened.crawl_state[ADDRESS]["synced"] is False
+    assert reopened.crawl_state[OTHER]["synced"] is True
+    assert reopened.crawl_state[ADDRESS]["is_supernode"] is True
+    assert reopened.tx_hashes == {"native", "token"}
+    assert reopened.accounts[ADDRESS]["last_seen_timestamp"] == "2023-11-14T22:14:20Z"
+    failed = False
+    retry = asyncio.run(worker.run_batch())
+    assert retry["claimed"] == retry["synced"] == 1
+    assert retry["failed"] == 0
+    assert CSVStore(str(tmp_path)).tx_hashes == {"native", "token"}
+    assert store.crawl_state[ADDRESS]["synced"] is True
+
+
+def test_run_batch_serializes_overlapping_calls(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}])
+    worker = make_worker()
+    worker.store = store
+    worker.client.get_account = AsyncMock(return_value=None)
+    worker.client.get_trx_transactions = AsyncMock(return_value=[])
+    worker.client.get_trc20_transfers = AsyncMock(return_value=[])
+
+    async def check():
+        first, second = await asyncio.gather(worker.run_batch(), worker.run_batch())
+        assert first["synced"] == 1
+        assert second["claimed"] == 0
+
+    asyncio.run(check())
+    worker.client.get_account.assert_awaited_once()
+
+
+def test_run_batch_write_failure_propagates_and_does_not_mark_synced(tmp_path, monkeypatch):
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}])
+    worker = make_worker()
+    worker.store = store
+    worker.client.get_account = AsyncMock(return_value={"address": ADDRESS})
+    worker.client.get_trx_transactions = AsyncMock(return_value=[])
+    worker.client.get_trc20_transfers = AsyncMock(return_value=[])
+
+    def fail(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_append_account_rows", fail)
+    with pytest.raises(OSError, match="disk full"):
+        asyncio.run(worker.run_batch())
+    assert CSVStore(str(tmp_path)).crawl_state[ADDRESS]["synced"] is False
+
+
+def test_run_batch_cancellation_leaves_frontier_retryable(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}, {"wallet_address": OTHER}])
+    worker = make_worker(max_concurrency=1)
+    worker.store = store
+
+    async def check():
+        started = asyncio.Event()
+        active = 0
+
+        async def endpoint(*args):
+            nonlocal active
+            active += 1
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                active -= 1
+
+        worker.client.get_account = endpoint
+        worker.client.get_trx_transactions = endpoint
+        worker.client.get_trc20_transfers = endpoint
+        task = asyncio.create_task(worker.run_batch())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert active == 0
+        assert not worker.semaphore.locked()
+
+    asyncio.run(check())
+    assert all(not row["synced"] for row in CSVStore(str(tmp_path)).crawl_state.values())
+
+
+def test_run_batch_rejects_mismatched_account_identity(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}])
+    worker = make_worker()
+    worker.store = store
+    worker.client.get_account = AsyncMock(return_value={"address": OTHER})
+    worker.client.get_trx_transactions = AsyncMock(return_value=[])
+    worker.client.get_trc20_transfers = AsyncMock(return_value=[])
+    assert asyncio.run(worker.run_batch())["failed"] == 1
+    assert OTHER not in store.accounts
+    assert store.crawl_state[ADDRESS]["synced"] is False

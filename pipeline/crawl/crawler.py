@@ -41,6 +41,58 @@ class CrawlerWorker:
         self.settings = settings
         self.max_concurrency = max_concurrency
         self.semaphore = asyncio.Semaphore(max_concurrency)
+        self._batch_lock = asyncio.Lock()
+
+    async def run_batch(self) -> dict:
+        """Persist one claimed batch; summary counts describe this batch's rows.
+
+        Claims are snapshots, so concurrent calls on this worker are serialized.
+        Successful partial rows are durable even when their wallet must retry.
+        Storage errors propagate; CSVStore reloads its durable state on failure.
+        """
+        async with self._batch_lock:
+            batch = self.store.claim_crawl_batch(self.settings.batch_size)
+            summary = dict(claimed=len(batch), synced=0, failed=0,
+                           accounts=0, transactions=0, supernodes=0)
+            if not batch:
+                return summary
+            tasks = [asyncio.create_task(self._fetch_wallet(row["address"])) for row in batch]
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            accounts = []
+            transactions = {}
+            synced_addresses = []
+            for claimed, result in zip(batch, results):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, Exception):
+                    continue
+                address, raw_account, raw_trx, raw_trc20 = result
+                account, txs, synced = self._normalize(raw_account, raw_trx, raw_trc20)
+                if address != claimed["address"]:
+                    continue
+                if account and account["address"] != address:
+                    # Never persist an API account under a different claimed wallet.
+                    synced = False
+                    account = {}
+                if account:
+                    accounts.append(account)
+                for tx in txs:
+                    transactions.setdefault(tx["tx_hash"], tx)
+                if synced:
+                    synced_addresses.append(address)
+            tx_rows = list(transactions.values())
+            supernodes = self._detect_supernodes(tx_rows, [row["address"] for row in batch])
+            self.store.upsert_crawled_data(accounts, tx_rows, synced_addresses, supernodes)
+            summary.update(synced=len(synced_addresses), failed=len(batch) - len(synced_addresses),
+                           accounts=len(accounts), transactions=len(tx_rows), supernodes=len(supernodes))
+            return summary
 
     async def _fetch_wallet(self, address: str) -> tuple:
         """Fetch three histories independently; retain failures for normalization.
