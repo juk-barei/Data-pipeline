@@ -8,11 +8,15 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
+
+import httpx
 
 from pipeline.api.client import TronGridClient
 from pipeline.api.keypool import MultiKeyPool
-from pipeline.config import Settings, load_env, load_settings
+from pipeline.config import Settings, load_env, load_settings, setup_logging
 from pipeline.orchestrate.health import HealthReporter
 from pipeline.orchestrate.runner import Runner
 from pipeline.seeds.discover import fetch_licit_seeds
@@ -115,7 +119,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
     settings = _settings(args)
     if not args.yes:
         try:
-            answer = input(f"Reset {settings.csv_dir.resolve()} to hop-0 seeds? [y/N] ")
+            answer = input(f"Reset {settings.csv_dir.expanduser().resolve()} to hop-0 seeds? [y/N] ")
         except (EOFError, KeyboardInterrupt):
             print("Reset cancelled.")
             return 1
@@ -165,3 +169,32 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if code == 0 and args.delete_local and not args.dry_run:
         delete_local(files)
     return code
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse a command, dispatch it, and return a process exit status."""
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as error:
+        return int(error.code)
+    setup_logging()
+    handlers = {
+        "fetch-seeds": cmd_fetch_seeds,
+        "run": cmd_run,
+        "monitor": cmd_monitor,
+        "reset": cmd_reset,
+        "compact": cmd_compact,
+        "sync": cmd_sync,
+    }
+    try:
+        return handlers[args.command](args)
+    except KeyboardInterrupt:
+        return 130
+    except (OSError, ValueError, RuntimeError, httpx.HTTPError, subprocess.SubprocessError) as error:
+        print(f"pipeline: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

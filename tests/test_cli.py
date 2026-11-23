@@ -333,3 +333,70 @@ def test_sync_empty_dataset_does_not_create_files_or_invoke_upload(tmp_path, mon
         cli.cmd_sync(Namespace(settings=Settings(csv_dir=tmp_path), compress=True, dry_run=False, delete_local=False))
     sync.assert_not_called()
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+def test_main_dispatches_all_commands_and_preserves_status(monkeypatch, command):
+    from unittest.mock import Mock
+
+    handler = Mock(return_value=7)
+    monkeypatch.setattr(cli, "cmd_" + command.replace("-", "_"), handler)
+    assert cli.main([command, "--csv-dir", "example"]) == 7
+    assert handler.call_args.args[0].csv_dir == Path("example")
+    assert handler.call_args.args[0].command == command
+
+
+@pytest.mark.parametrize("arguments,code", [([], 2), (["unknown"], 2), (["--help"], 0)])
+def test_main_returns_parser_status_with_usage(arguments, code, capsys):
+    assert cli.main(arguments) == code
+    output = capsys.readouterr()
+    assert "usage:" in (output.out + output.err)
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError("missing file"), ValueError("invalid setting"),
+                                   RuntimeError("failed discovery")])
+def test_main_reports_operational_errors(monkeypatch, capsys, error):
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(cli, "cmd_monitor", Mock(side_effect=error))
+    assert cli.main(["monitor"]) == 1
+    assert str(error) in capsys.readouterr().err
+
+
+def test_main_keyboard_interrupt_returns_130(monkeypatch):
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(cli, "cmd_fetch_seeds", Mock(side_effect=KeyboardInterrupt))
+    assert cli.main(["fetch-seeds"]) == 130
+
+
+def test_module_entrypoint_runs_offline_monitor(tmp_path):
+    import subprocess
+    import sys
+
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}])
+    result = subprocess.run([sys.executable, "-B", "-m", "pipeline.cli", "monitor", "--csv-dir", str(tmp_path)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "Hop 0: 1 wallets" in result.stdout
+    invalid = subprocess.run([sys.executable, "-B", "-m", "pipeline.cli", "unknown"],
+                             capture_output=True, text=True, timeout=30)
+    assert invalid.returncode == 2
+    assert "usage:" in invalid.stderr
+
+
+def test_reset_confirmation_displays_expanded_storage_target(monkeypatch):
+    from unittest.mock import Mock
+
+    supplied = Path("~/dataset")
+    expected = supplied.expanduser().resolve()
+    prompt = Mock(return_value="yes")
+    factory = Mock()
+    monkeypatch.setattr("builtins.input", prompt)
+    monkeypatch.setattr(cli, "CSVStore", factory)
+    assert cli.cmd_reset(Namespace(settings=Settings(csv_dir=supplied), yes=False)) == 0
+    actual_target = Path(factory.call_args.args[0]).expanduser().resolve()
+    assert actual_target == expected
+    assert str(actual_target) in prompt.call_args.args[0]
+    factory.return_value.reset_to_seeds.assert_called_once_with()
