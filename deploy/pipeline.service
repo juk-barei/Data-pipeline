@@ -1,0 +1,19 @@
+[Unit]
+Description=Tron CSV pipeline
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=${user}
+WorkingDirectory=${project_dir}
+EnvironmentFile=${env_file}
+Environment="CSV_DIR=${csv_dir}"
+ExecStart="${python}" -m pipeline.cli run
+Restart=on-failure
+RestartSec=30s
+KillSignal=SIGINT
+TimeoutStopSec=120s
+
+[Install]
+WantedBy=multi-user.target

@@ -12,5 +12,8 @@ dependencies = ["python-dotenv>=1.0,<2", "httpx[http2]>=0.28,<1"]
 test = ["pytest>=8,<9"]
 parquet = ["pyarrow>=14"]
 
+[tool.setuptools.packages.find]
+include = ["pipeline*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

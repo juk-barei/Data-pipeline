@@ -1,0 +1,15 @@
+[Unit]
+Description=Copy Tron CSV dataset to Drive
+Wants=network-online.target
+After=network-online.target pipeline.service
+# Avoid exporting while the runner is writing its append logs. Auto-sync is
+# already part of the runner; this timer handles periods when it is stopped.
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c '! /usr/bin/systemctl --quiet is-active pipeline.service'
+User=${user}
+WorkingDirectory=${project_dir}
+EnvironmentFile=${env_file}
+Environment="CSV_DIR=${csv_dir}"
+ExecStart="${python}" -m pipeline.cli sync
