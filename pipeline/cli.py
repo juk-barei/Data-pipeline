@@ -7,6 +7,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+import shutil
+import tempfile
 
 from pipeline.api.client import TronGridClient
 from pipeline.api.keypool import MultiKeyPool
@@ -15,6 +17,7 @@ from pipeline.orchestrate.health import HealthReporter
 from pipeline.orchestrate.runner import Runner
 from pipeline.seeds.discover import fetch_licit_seeds
 from pipeline.storage.csv_store import CSVStore
+from pipeline.sync.drive import compress_gzip, delete_local, sync_to_drive
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,3 +133,35 @@ def cmd_compact(args: argparse.Namespace) -> int:
     store = CSVStore(str(settings.csv_dir))
     store.compact()
     return 0
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Upload stable exports; delete only after the real upload confirms success.
+
+    Writers must be stopped, as required by the sync and deletion interfaces.
+    Compressed dry runs use temporary copies so dataset bytes stay untouched.
+    """
+    settings = _settings(args)
+    directory = settings.csv_dir.expanduser().resolve()
+    files = sorted(path for path in directory.iterdir()
+                   if path.name.endswith((".csv", ".csv.gz", ".parquet")))
+    if not files:
+        raise ValueError("No dataset exports found to sync")
+    if any(path.is_symlink() or not path.is_file() for path in files):
+        raise ValueError("Dataset exports must be regular files, not symlinks")
+
+    if args.compress and args.dry_run:
+        with tempfile.TemporaryDirectory(prefix="pipeline-cli-sync-") as temporary:
+            preview = Path(temporary)
+            for path in files:
+                shutil.copy2(path, preview / path.name)
+            for path in sorted(preview.glob("*.csv")):
+                compress_gzip(path)
+            return sync_to_drive(preview, settings.drive_remote, settings.drive_path, dry_run=True)
+
+    if args.compress:
+        files = sorted(set(files + [compress_gzip(path) for path in files if path.suffix == ".csv"]))
+    code = sync_to_drive(directory, settings.drive_remote, settings.drive_path, dry_run=args.dry_run)
+    if code == 0 and args.delete_local and not args.dry_run:
+        delete_local(files)
+    return code

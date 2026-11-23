@@ -229,3 +229,107 @@ def test_compact_deduplicates_logs_and_is_idempotent(tmp_path):
     assert before == {name: path.read_bytes() for name, path in store.paths.items()}
     assert metrics == CSVStore(str(tmp_path)).get_metrics()
     assert ADDRESS in CSVStore(str(tmp_path)).seeds
+
+
+@pytest.mark.parametrize("code", [0, 7])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_sync_forwards_arguments_and_exit_code(tmp_path, monkeypatch, code, dry_run):
+    from unittest.mock import Mock
+
+    (tmp_path / "accounts.csv").write_text("address\nexample\n", encoding="utf-8")
+    sync = Mock(return_value=code)
+    delete = Mock()
+    monkeypatch.setattr(cli, "sync_to_drive", sync)
+    monkeypatch.setattr(cli, "delete_local", delete)
+    settings = Settings(csv_dir=tmp_path, drive_remote="drive", drive_path="archive")
+    args = Namespace(settings=settings, compress=False, dry_run=dry_run, delete_local=True)
+    assert cli.cmd_sync(args) == code
+    sync.assert_called_once_with(tmp_path, "drive", "archive", dry_run=dry_run)
+    if code == 0 and not dry_run:
+        delete.assert_called_once_with([tmp_path / "accounts.csv"])
+    else:
+        delete.assert_not_called()
+
+
+def test_compressed_sync_uses_real_receipts_before_deleting_temporary_dataset(tmp_path, monkeypatch):
+    import gzip
+    from types import SimpleNamespace
+    from pipeline.sync import drive
+
+    source = tmp_path / "accounts.csv"
+    content = b"address\nexample\n"
+    source.write_bytes(content)
+    (tmp_path / "keep.txt").write_text("unrelated", encoding="utf-8")
+    monkeypatch.setattr(drive, "ensure_rclone", lambda: "rclone")
+    uploads = []
+
+    def upload(command, **kwargs):
+        # rclone receives a stable snapshot, with both source and gzip exports.
+        snapshot = Path(command[-2])
+        assert (snapshot / source.name).read_bytes() == content
+        assert gzip.decompress((snapshot / "accounts.csv.gz").read_bytes()) == content
+        uploads.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(drive.subprocess, "run", upload)
+    args = Namespace(settings=Settings(csv_dir=tmp_path, drive_remote="drive"),
+                     compress=True, dry_run=False, delete_local=True)
+    assert cli.cmd_sync(args) == 0
+    assert len(uploads) == 1
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["keep.txt"]
+
+
+def test_compressed_dry_run_previews_gzip_without_changing_dataset(tmp_path, monkeypatch):
+    import gzip
+    from unittest.mock import Mock
+
+    source = tmp_path / "accounts.csv"
+    source.write_bytes(b"address\nexample\n")
+    existing = tmp_path / "accounts.csv.gz"
+    existing.write_bytes(b"previous export")
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    previews = []
+
+    def preview(directory, remote, remote_path, *, dry_run):
+        assert dry_run is True
+        assert (remote, remote_path) == ("drive", "archive")
+        assert directory != tmp_path
+        assert gzip.decompress((directory / existing.name).read_bytes()) == source.read_bytes()
+        previews.append(directory)
+        return 9
+
+    delete = Mock(side_effect=AssertionError("dry run must not delete"))
+    monkeypatch.setattr(cli, "sync_to_drive", preview)
+    monkeypatch.setattr(cli, "delete_local", delete)
+    args = Namespace(settings=Settings(csv_dir=tmp_path, drive_remote="drive", drive_path="archive"),
+                     compress=True, dry_run=True, delete_local=True)
+    assert cli.cmd_sync(args) == 9
+    assert before == {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    assert not previews[0].exists()
+    delete.assert_not_called()
+
+
+def test_failed_compressed_sync_keeps_sources_and_exports(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    source = tmp_path / "accounts.csv"
+    source.write_bytes(b"address\nexample\n")
+    monkeypatch.setattr(cli, "sync_to_drive", Mock(return_value=4))
+    delete = Mock()
+    monkeypatch.setattr(cli, "delete_local", delete)
+    args = Namespace(settings=Settings(csv_dir=tmp_path), compress=True, dry_run=False, delete_local=True)
+    assert cli.cmd_sync(args) == 4
+    assert source.read_bytes() == b"address\nexample\n"
+    assert (tmp_path / "accounts.csv.gz").is_file()
+    delete.assert_not_called()
+
+
+def test_sync_empty_dataset_does_not_create_files_or_invoke_upload(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    sync = Mock()
+    monkeypatch.setattr(cli, "sync_to_drive", sync)
+    with pytest.raises(ValueError, match="No dataset exports"):
+        cli.cmd_sync(Namespace(settings=Settings(csv_dir=tmp_path), compress=True, dry_run=False, delete_local=False))
+    sync.assert_not_called()
+    assert not list(tmp_path.iterdir())
