@@ -107,3 +107,47 @@ def test_command_loads_env_and_applies_directory_override(tmp_path, monkeypatch,
     assert cli.cmd_fetch_seeds(args) == 0
     assert (output / "seed_wallets.csv").is_file()
     assert fetch.await_args.args[1] == 1
+
+
+@pytest.mark.parametrize("step", [True, False])
+def test_run_dispatches_to_requested_mode(tmp_path, monkeypatch, fake_clients, step):
+    from unittest.mock import Mock
+
+    runner = Mock(run_once=AsyncMock(), run_forever=AsyncMock())
+    factory = Mock(return_value=runner)
+    monkeypatch.setattr(cli, "Runner", factory)
+    settings = Settings(csv_dir=tmp_path, sync_every=0)
+    assert cli.cmd_run(Namespace(settings=settings, step=step)) == 0
+    (runner.run_once if step else runner.run_forever).assert_awaited_once()
+    (runner.run_forever if step else runner.run_once).assert_not_awaited()
+    store, client, actual_settings = factory.call_args.args
+    assert store.csv_dir == tmp_path
+    assert client is fake_clients[0]
+    assert actual_settings is settings
+    client.aclose.assert_awaited_once()
+
+
+def test_run_real_idle_step_requires_no_network(tmp_path, fake_clients):
+    assert cli.cmd_run(Namespace(settings=Settings(csv_dir=tmp_path), step=True)) == 0
+    fake_clients[0].aclose.assert_awaited_once()
+    assert len(list(tmp_path.glob("*.csv"))) == 5
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), RuntimeError("runner failed")])
+def test_run_failure_closes_client_and_preserves_csvs(tmp_path, monkeypatch, fake_clients, error):
+    from unittest.mock import Mock
+
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}])
+    before = {name: path.read_bytes() for name, path in store.paths.items()}
+    runner = Mock(run_forever=AsyncMock(side_effect=error))
+    monkeypatch.setattr(cli, "Runner", Mock(return_value=runner))
+    args = Namespace(settings=Settings(csv_dir=tmp_path), step=False)
+    if isinstance(error, KeyboardInterrupt):
+        assert cli.cmd_run(args) == 130
+    else:
+        with pytest.raises(RuntimeError, match="runner failed"):
+            cli.cmd_run(args)
+    fake_clients[0].aclose.assert_awaited_once()
+    assert before == {name: path.read_bytes() for name, path in store.paths.items()}
+    assert ADDRESS in CSVStore(str(tmp_path)).seeds

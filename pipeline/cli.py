@@ -11,6 +11,7 @@ from pathlib import Path
 from pipeline.api.client import TronGridClient
 from pipeline.api.keypool import MultiKeyPool
 from pipeline.config import Settings, load_env, load_settings
+from pipeline.orchestrate.runner import Runner
 from pipeline.seeds.discover import fetch_licit_seeds
 from pipeline.storage.csv_store import CSVStore
 
@@ -74,4 +75,24 @@ def cmd_fetch_seeds(args: argparse.Namespace) -> int:
             store.insert_seeds(seeds)
 
     asyncio.run(fetch())
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Run one cycle or the orchestration loop, closing HTTP on interruption."""
+    settings = _settings(args)
+    store = CSVStore(str(settings.csv_dir))
+
+    async def run() -> None:
+        async with _client(settings) as client:
+            runner = Runner(store, client, settings)
+            if args.step:
+                await runner.run_once()
+            else:
+                await runner.run_forever()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        return 130
     return 0
