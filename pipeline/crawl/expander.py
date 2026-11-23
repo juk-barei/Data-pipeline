@@ -29,3 +29,27 @@ class ExpanderWorker:
         if address == receiver:
             return "BACKWARD"
         return None
+
+    def _collect_counterparties(self, address: str) -> list[dict]:
+        """Return one edge candidate per canonical target in stored tx order.
+
+        If transfers exist in both directions, retain the first transaction's
+        direction and hash as deterministic discovery provenance.
+        """
+        address = normalize_address(address)
+        if not address:
+            return []
+        candidates = []
+        seen = set()
+        for tx in self.store.get_wallet_transactions(address):
+            direction = self._classify_direction(tx, address)
+            if direction is None:
+                continue
+            target = normalize_address(tx["to_address"] if direction == "FORWARD"
+                                       else tx["from_address"])
+            tx_hash = tx.get("tx_hash")
+            if not isinstance(tx_hash, str) or not tx_hash.strip() or target in seen:
+                continue
+            seen.add(target)
+            candidates.append({"target": target, "direction": direction, "via_tx": tx_hash})
+        return candidates
