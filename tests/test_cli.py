@@ -211,3 +211,21 @@ def test_reset_confirmation_preserves_seeds_and_clears_derived_data(tmp_path, mo
     assert reopened.crawl_state[ADDRESS]["hop_level"] == 0
     assert reopened.crawl_state[ADDRESS]["synced"] is False
     assert reopened.crawl_state[ADDRESS]["expanded"] is False
+
+
+def test_compact_deduplicates_logs_and_is_idempotent(tmp_path):
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}])
+    # Append a duplicate snapshot row, matching normal last-row-wins log semantics.
+    with store.accounts_path.open("ab") as output:
+        output.write(store.accounts_path.read_bytes().splitlines(keepends=True)[1])
+    assert len(store.accounts_path.read_bytes().splitlines()) == 3
+    args = Namespace(settings=Settings(csv_dir=tmp_path))
+    assert cli.cmd_compact(args) == 0
+    assert len(store.accounts_path.read_bytes().splitlines()) == 2
+    before = {name: path.read_bytes() for name, path in store.paths.items()}
+    metrics = CSVStore(str(tmp_path)).get_metrics()
+    assert cli.cmd_compact(args) == 0
+    assert before == {name: path.read_bytes() for name, path in store.paths.items()}
+    assert metrics == CSVStore(str(tmp_path)).get_metrics()
+    assert ADDRESS in CSVStore(str(tmp_path)).seeds

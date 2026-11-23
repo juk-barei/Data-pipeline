@@ -122,3 +122,11 @@ def cmd_reset(args: argparse.Namespace) -> int:
     store = CSVStore(str(settings.csv_dir))
     store.reset_to_seeds()
     return 0
+
+
+def cmd_compact(args: argparse.Namespace) -> int:
+    """Rewrite append logs as deduplicated snapshots while writers are stopped."""
+    settings = _settings(args)
+    store = CSVStore(str(settings.csv_dir))
+    store.compact()
+    return 0
