@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import tempfile
 
-from pipeline.config import Settings
+from pipeline.config import Settings, load_env, load_settings
 from pipeline.storage.csv_store import CSVStore
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,37 @@ def build_dest(remote: str, remote_path: str) -> str:
     if "\x00" in remote_path or "\x00" in name:
         raise ValueError("rclone destination cannot contain a null character")
     return f"{name}:{remote_path.strip('/')}"
+
+
+def check_dependencies() -> None:
+    """Check the configured Drive destination without copying or deleting data.
+
+    Use the same environment settings as the CLI. Bound both rclone's retries
+    and the subprocess lifetime so a startup check cannot hang a long crawl.
+    """
+    load_env()
+    settings = load_settings()
+    executable = ensure_rclone()
+    destination = build_dest(settings.drive_remote, settings.drive_path)
+    try:
+        result = subprocess.run(
+            [executable, "lsf", "--max-depth", "1", "--timeout", "15s",
+             "--contimeout", "10s", "--retries", "1", "--low-level-retries", "1",
+             "--", destination],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(
+            "Drive startup check could not complete; check network access and "
+            "rclone installation, then retry."
+        ) from error
+    if result.returncode != 0:
+        # rclone stderr may contain remote URLs or credentials; do not echo it.
+        raise RuntimeError(
+            "Drive remote is unreachable; check DRIVE_REMOTE/DRIVE_PATH, run "
+            "'rclone config' to configure credentials, and verify access with 'rclone lsf'."
+        )
 
 
 def compress_gzip(path: Path) -> Path:
