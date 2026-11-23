@@ -2,7 +2,7 @@ import copy
 
 import pytest
 
-from pipeline.api.parsers import parse_account, parse_trx_transaction
+from pipeline.api.parsers import parse_account, parse_trc20_transfer, parse_trx_transaction
 from pipeline.storage.schema import build_headers
 from pipeline.utils.address import to_hex
 
@@ -117,3 +117,65 @@ def test_trx_accepts_integer_strings_and_preserves_smallest_unit(trx_payload):
 @pytest.mark.parametrize("raw", [None, [], "bad", {}])
 def test_trx_invalid_outer_payload_is_safe(raw):
     assert parse_trx_transaction(raw) is None
+
+
+@pytest.fixture
+def trc20_payload():
+    return {
+        "transaction_id": "token-hash", "block_timestamp": 1700000000000,
+        "from": to_hex(ADDRESS), "to": OTHER, "type": "Transfer",
+        "value": "1234567",
+        "token_info": {"address": ADDRESS, "symbol": "USDT", "decimals": "6"},
+    }
+
+
+def test_trc20_normalizes_six_decimals_and_matches_csv_schema(trc20_payload):
+    original = copy.deepcopy(trc20_payload)
+    row = parse_trc20_transfer(trc20_payload)
+    assert row == {
+        "tx_hash": "token-hash", "block_number": "",
+        "block_timestamp": "2023-11-14T22:13:20Z",
+        "from_address": ADDRESS, "to_address": OTHER,
+        "token_symbol": "USDT", "contract_address": ADDRESS,
+        "amount": "1.234567", "fee_trx": "", "created_at": NOW,
+    }
+    assert set(row) == set(build_headers()["transactions.csv"])
+    assert trc20_payload == original
+
+
+@pytest.mark.parametrize("value,decimals,expected", [
+    ("1", 6, "0.000001"), (0, 0, "0"), (12, 0, "12"),
+    ("123456789012345678901234567890123456789", 6,
+     "123456789012345678901234567890123.456789"),
+])
+def test_trc20_preserves_exact_amounts(trc20_payload, value, decimals, expected):
+    trc20_payload["value"] = value
+    trc20_payload["token_info"]["decimals"] = decimals
+    assert parse_trc20_transfer(trc20_payload)["amount"] == expected
+
+
+@pytest.mark.parametrize("field,value", [
+    ("transaction_id", None), ("transaction_id", ""),
+    ("block_timestamp", None), ("block_timestamp", "bad"),
+    ("from", "bad"), ("to", None), ("token_info", []),
+    ("value", "NaN"), ("value", -1), ("value", True),
+    ("value", 1.5), ("type", "Approval"),
+])
+def test_trc20_unusable_records_are_dropped(trc20_payload, field, value):
+    trc20_payload[field] = value
+    assert parse_trc20_transfer(trc20_payload) is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("decimals", None), ("decimals", -1), ("decimals", 256),
+    ("decimals", True), ("decimals", "6.0"), ("decimals", 1.5),
+    ("address", "bad"), ("symbol", []),
+])
+def test_trc20_invalid_token_metadata_is_dropped(trc20_payload, field, value):
+    trc20_payload["token_info"][field] = value
+    assert parse_trc20_transfer(trc20_payload) is None
+
+
+@pytest.mark.parametrize("raw", [None, [], "bad", {}])
+def test_trc20_invalid_outer_payload_is_safe(raw):
+    assert parse_trc20_transfer(raw) is None

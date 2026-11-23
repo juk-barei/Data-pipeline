@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 from pipeline.utils.address import normalize_address, to_hex
 from pipeline.utils.timeutils import format_iso, now_iso, parse_timestamp
@@ -75,5 +75,51 @@ def parse_trx_transaction(raw: dict) -> dict | None:
         "contract_address": "",
         "amount": format(Decimal(str(amount)) / 1_000_000, "f"),
         "fee_trx": format(Decimal(str(fee)) / 1_000_000, "f"),
+        "created_at": now_iso(),
+    }
+
+
+def parse_trc20_transfer(raw: dict) -> dict | None:
+    """Normalize a token Transfer with exact integer-to-decimal conversion."""
+    if not isinstance(raw, dict) or raw.get("type", "Transfer") != "Transfer":
+        return None
+    tx_hash = raw.get("transaction_id")
+    timestamp = format_iso(parse_timestamp(raw.get("block_timestamp")))
+    token = raw.get("token_info")
+    if not isinstance(tx_hash, str) or not tx_hash.strip() or not timestamp:
+        return None
+    if not isinstance(token, dict):
+        return None
+    sender = normalize_address(raw.get("from"))
+    receiver = normalize_address(raw.get("to"))
+    contract = normalize_address(token.get("address"))
+    amount = raw.get("value")
+    decimals = token.get("decimals")
+    for number in (amount, decimals):
+        if type(number) is int and number >= 0:
+            continue
+        if isinstance(number, str) and number.isascii() and number.isdigit():
+            continue
+        return None
+    decimals = int(decimals)
+    if decimals > 255 or not sender or not receiver or not contract:
+        return None
+    symbol = token.get("symbol", "")
+    if not isinstance(symbol, str):
+        return None
+    # Token values can exceed Decimal's default 28-digit precision.
+    with localcontext() as context:
+        context.prec = max(1, len(str(amount))) + decimals + 1
+        normalized_amount = format(Decimal(str(amount)).scaleb(-decimals), "f")
+    return {
+        "tx_hash": tx_hash,
+        "block_number": raw.get("blockNumber", ""),
+        "block_timestamp": timestamp,
+        "from_address": sender,
+        "to_address": receiver,
+        "token_symbol": symbol,
+        "contract_address": contract,
+        "amount": normalized_amount,
+        "fee_trx": "",
         "created_at": now_iso(),
     }
