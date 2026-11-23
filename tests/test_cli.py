@@ -151,3 +151,23 @@ def test_run_failure_closes_client_and_preserves_csvs(tmp_path, monkeypatch, fak
     fake_clients[0].aclose.assert_awaited_once()
     assert before == {name: path.read_bytes() for name, path in store.paths.items()}
     assert ADDRESS in CSVStore(str(tmp_path)).seeds
+
+
+def test_monitor_reads_existing_dataset_without_network(tmp_path, monkeypatch, capsys):
+    from unittest.mock import Mock
+
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}])
+    before = {name: path.read_bytes() for name, path in store.paths.items()}
+    network = Mock(side_effect=AssertionError("monitor must stay offline"))
+    monkeypatch.setattr(cli, "TronGridClient", network)
+    monkeypatch.setattr(cli, "MultiKeyPool", network)
+    assert cli.cmd_monitor(Namespace(settings=Settings(csv_dir=tmp_path, api_keys=()))) == 0
+    output = capsys.readouterr().out
+    assert "Pipeline health" in output
+    assert "Hop 0: 1 wallets" in output
+    assert "Hop 5: 0 wallets" in output
+    assert "Pending crawls: 1" in output
+    assert "Complete: no" in output
+    network.assert_not_called()
+    assert before == {name: path.read_bytes() for name, path in store.paths.items()}

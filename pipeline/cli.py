@@ -11,6 +11,7 @@ from pathlib import Path
 from pipeline.api.client import TronGridClient
 from pipeline.api.keypool import MultiKeyPool
 from pipeline.config import Settings, load_env, load_settings
+from pipeline.orchestrate.health import HealthReporter
 from pipeline.orchestrate.runner import Runner
 from pipeline.seeds.discover import fetch_licit_seeds
 from pipeline.storage.csv_store import CSVStore
@@ -95,4 +96,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         asyncio.run(run())
     except KeyboardInterrupt:
         return 130
+    return 0
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    """Print a local dataset snapshot without opening an HTTP client."""
+    settings = _settings(args)
+    store = CSVStore(str(settings.csv_dir))
+    print(HealthReporter(store).render())
     return 0
