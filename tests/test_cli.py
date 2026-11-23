@@ -171,3 +171,43 @@ def test_monitor_reads_existing_dataset_without_network(tmp_path, monkeypatch, c
     assert "Complete: no" in output
     network.assert_not_called()
     assert before == {name: path.read_bytes() for name, path in store.paths.items()}
+
+
+@pytest.mark.parametrize("answer", ["", "n", "maybe", EOFError(), KeyboardInterrupt()])
+def test_reset_cancellation_never_opens_dataset(tmp_path, monkeypatch, answer):
+    from unittest.mock import Mock
+
+    def respond(prompt):
+        assert str(tmp_path) in prompt
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr("builtins.input", respond)
+    store = Mock(side_effect=AssertionError("cancelled reset must not open storage"))
+    monkeypatch.setattr(cli, "CSVStore", store)
+    assert cli.cmd_reset(Namespace(settings=Settings(csv_dir=tmp_path), yes=False)) == 1
+    store.assert_not_called()
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("yes", [False, True])
+def test_reset_confirmation_preserves_seeds_and_clears_derived_data(tmp_path, monkeypatch, yes):
+    from unittest.mock import Mock
+
+    store = CSVStore(str(tmp_path))
+    store.insert_seeds([{"wallet_address": ADDRESS}])
+    store.upsert_crawled_data([], [{"tx_hash": "old", "from_address": ADDRESS}], [ADDRESS], [])
+    before_seeds = store.seed_wallets_path.read_bytes()
+    prompt = Mock(return_value=" YES ")
+    monkeypatch.setattr("builtins.input", prompt)
+    assert cli.cmd_reset(Namespace(settings=Settings(csv_dir=tmp_path), yes=yes)) == 0
+    assert prompt.call_count == (0 if yes else 1)
+    reopened = CSVStore(str(tmp_path))
+    assert reopened.seed_wallets_path.read_bytes() == before_seeds
+    assert list(reopened.accounts) == [ADDRESS]
+    assert reopened.tx_hashes == set()
+    assert reopened.hops == []
+    assert reopened.crawl_state[ADDRESS]["hop_level"] == 0
+    assert reopened.crawl_state[ADDRESS]["synced"] is False
+    assert reopened.crawl_state[ADDRESS]["expanded"] is False

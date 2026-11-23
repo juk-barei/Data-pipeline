@@ -105,3 +105,20 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     store = CSVStore(str(settings.csv_dir))
     print(HealthReporter(store).render())
     return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    """Reset only after confirmation; cancellation leaves the dataset unopened."""
+    settings = _settings(args)
+    if not args.yes:
+        try:
+            answer = input(f"Reset {settings.csv_dir.resolve()} to hop-0 seeds? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            print("Reset cancelled.")
+            return 1
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("Reset cancelled.")
+            return 1
+    store = CSVStore(str(settings.csv_dir))
+    store.reset_to_seeds()
+    return 0
