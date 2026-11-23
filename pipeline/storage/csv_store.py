@@ -35,6 +35,8 @@ class CSVStore:
         self._reset_marker_path = self.csv_dir / ".reset-to-seeds.json"
         self.retain_all_seeds = retain_all_seeds
         self._appended_since_compact = 0
+        # Lifetime counter for sync cadence; compaction/reset must not erase it.
+        self.appended_rows = 0
 
         self.seeds: dict[str, dict[str, str]] = {}
         self.accounts: dict[str, dict[str, str]] = {}
@@ -100,6 +102,7 @@ class CSVStore:
         self._appended_since_compact = (
             getattr(self, "_appended_since_compact", 0) + len(pending)
         )
+        self.appended_rows = getattr(self, "appended_rows", 0) + len(pending)
 
     def _write_snapshot(
         self,

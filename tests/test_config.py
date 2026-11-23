@@ -2,6 +2,7 @@ import logging
 import os
 
 from pipeline.config import load_env, load_settings, setup_logging
+import pytest
 
 
 def test_load_env_missing_file_is_safe(tmp_path):
@@ -39,3 +40,9 @@ def test_setup_logging_is_idempotent():
 
     after = sum(bool(getattr(h, "_tron_pipeline", False)) for h in root.handlers)
     assert after == max(1, before)
+
+
+@pytest.mark.parametrize("value,expected", [("0", 0), ("3", 3), ("-1", 10), ("invalid", 10)])
+def test_sync_every_can_disable_auto_sync(monkeypatch, value, expected):
+    monkeypatch.setenv("SYNC_EVERY", value)
+    assert load_settings().sync_every == expected
