@@ -56,3 +56,9 @@ def test_missing_binary_keeps_install_hint(startup, monkeypatch):
     with pytest.raises(FileNotFoundError, match="install"):
         drive.check_dependencies()
     startup.assert_not_called()
+
+
+def test_dependency_check_uses_resolved_settings_instead_of_environment(startup):
+    drive.check_dependencies(Settings(drive_remote="override", drive_path="actual/path"))
+    assert startup.call_args.args[0][-1] == "override:actual/path"
+    drive.load_env.assert_not_called()

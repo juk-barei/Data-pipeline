@@ -57,14 +57,17 @@ def build_dest(remote: str, remote_path: str) -> str:
     return f"{name}:{remote_path.strip('/')}"
 
 
-def check_dependencies() -> None:
+def check_dependencies(settings: Settings | None = None) -> None:
     """Check the configured Drive destination without copying or deleting data.
 
-    Use the same environment settings as the CLI. Bound both rclone's retries
+    Without an argument, resolve environment settings. The CLI passes its
+    resolved settings so programmatic overrides check the same destination.
+    Bound both rclone's retries
     and the subprocess lifetime so a startup check cannot hang a long crawl.
     """
-    load_env()
-    settings = load_settings()
+    if settings is None:
+        load_env()
+        settings = load_settings()
     executable = ensure_rclone()
     destination = build_dest(settings.drive_remote, settings.drive_path)
     try:

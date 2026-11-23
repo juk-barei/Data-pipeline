@@ -60,6 +60,7 @@ def fake_clients(monkeypatch):
             clients.append(self)
 
     monkeypatch.setattr(cli, "TronGridClient", Client)
+    monkeypatch.setattr(cli, "wait_for_api", AsyncMock())
     return clients
 
 
@@ -88,16 +89,16 @@ def test_fetch_failure_closes_client_and_leaves_csvs_intact(tmp_path, monkeypatc
     before = {name: path.read_bytes() for name, path in store.paths.items()}
     monkeypatch.setattr(cli, "fetch_licit_seeds", AsyncMock(side_effect=RuntimeError("failed")))
     with pytest.raises(RuntimeError, match="failed"):
-        cli.cmd_fetch_seeds(Namespace(settings=Settings(csv_dir=tmp_path)))
+        cli.cmd_fetch_seeds(Namespace(settings=Settings(csv_dir=tmp_path, api_keys=("test-key",))))
     fake_clients[0].aclose.assert_awaited_once()
     assert before == {name: path.read_bytes() for name, path in store.paths.items()}
 
 
 def test_command_loads_env_and_applies_directory_override(tmp_path, monkeypatch, fake_clients):
     env = tmp_path / "custom.env"
-    env.write_text("SEED_COUNT=1\nCSV_DIR=unused\n", encoding="utf-8")
+    env.write_text("SEED_COUNT=1\nCSV_DIR=unused\nTRONGRID_API_KEYS=test-key\n", encoding="utf-8")
     # Record both keys so monkeypatch also undoes dotenv modifications.
-    for key in ("SEED_COUNT", "CSV_DIR"):
+    for key in ("SEED_COUNT", "CSV_DIR", "TRONGRID_API_KEYS"):
         monkeypatch.setenv(key, "temporary")
         monkeypatch.delenv(key)
     fetch = AsyncMock(return_value=[])
@@ -116,7 +117,7 @@ def test_run_dispatches_to_requested_mode(tmp_path, monkeypatch, fake_clients, s
     runner = Mock(run_once=AsyncMock(), run_forever=AsyncMock())
     factory = Mock(return_value=runner)
     monkeypatch.setattr(cli, "Runner", factory)
-    settings = Settings(csv_dir=tmp_path, sync_every=0)
+    settings = Settings(csv_dir=tmp_path, sync_every=0, api_keys=("test-key",))
     assert cli.cmd_run(Namespace(settings=settings, step=step)) == 0
     (runner.run_once if step else runner.run_forever).assert_awaited_once()
     (runner.run_forever if step else runner.run_once).assert_not_awaited()
@@ -127,8 +128,8 @@ def test_run_dispatches_to_requested_mode(tmp_path, monkeypatch, fake_clients, s
     client.aclose.assert_awaited_once()
 
 
-def test_run_real_idle_step_requires_no_network(tmp_path, fake_clients):
-    assert cli.cmd_run(Namespace(settings=Settings(csv_dir=tmp_path), step=True)) == 0
+def test_run_real_idle_step_with_mocked_startup_probe(tmp_path, fake_clients):
+    assert cli.cmd_run(Namespace(settings=Settings(csv_dir=tmp_path, api_keys=("test-key",)), step=True)) == 0
     fake_clients[0].aclose.assert_awaited_once()
     assert len(list(tmp_path.glob("*.csv"))) == 5
 
@@ -142,7 +143,7 @@ def test_run_failure_closes_client_and_preserves_csvs(tmp_path, monkeypatch, fak
     before = {name: path.read_bytes() for name, path in store.paths.items()}
     runner = Mock(run_forever=AsyncMock(side_effect=error))
     monkeypatch.setattr(cli, "Runner", Mock(return_value=runner))
-    args = Namespace(settings=Settings(csv_dir=tmp_path), step=False)
+    args = Namespace(settings=Settings(csv_dir=tmp_path, api_keys=("test-key",), sync_every=0), step=False)
     if isinstance(error, KeyboardInterrupt):
         assert cli.cmd_run(args) == 130
     else:

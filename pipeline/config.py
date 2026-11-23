@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 
 from dotenv import load_dotenv
 
@@ -92,3 +94,53 @@ def setup_logging(level: str = "INFO") -> None:
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )
+
+
+def validate_config(settings: Settings) -> list[str]:
+    """Report startup configuration errors without mutating frozen settings.
+
+    Duplicate keys are rejected and counted once for throughput, matching the
+    key pool's deduplication. Callers may disable sync in a replaced Settings
+    value for operations that do not use Drive. Offline commands need not call
+    this network startup validator.
+    """
+    errors: list[str] = []
+    keys = []
+    for key in settings.api_keys:
+        if not isinstance(key, str) or not key.strip() or key != key.strip():
+            errors.append("TRONGRID_API_KEYS must contain nonblank keys without surrounding whitespace")
+        else:
+            keys.append(key)
+    unique_keys = set(keys)
+    if not unique_keys:
+        errors.append("TRONGRID_API_KEYS requires at least one API key")
+    if len(unique_keys) != len(keys):
+        errors.append("TRONGRID_API_KEYS contains duplicate keys; configure each key once")
+    rate = settings.rate_limit_per_key
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+        errors.append("RATE_LIMIT_PER_KEY must be finite and positive")
+    else:
+        logging.getLogger(__name__).info(
+            "Expected aggregate throughput: %g requests/s across %d unique API keys",
+            len(unique_keys) * rate, len(unique_keys),
+        )
+    for field in ("seed_count", "batch_size", "hop_depth", "supernode_threshold", "cooldown_sec", "max_concurrency"):
+        value = getattr(settings, field)
+        if type(value) is not int or value < 1:
+            errors.append(f"{field} must be a positive integer")
+    if type(settings.sync_every) is not int or settings.sync_every < 0:
+        errors.append("SYNC_EVERY must be a nonnegative integer")
+    elif settings.sync_every > 0:
+        remote = settings.drive_remote.strip().removesuffix(":")
+        if not remote or remote.startswith("-") or any(char in remote for char in ":/\\\r\n\x00"):
+            errors.append("DRIVE_REMOTE must name a configured rclone remote when sync is enabled")
+        if any(char in settings.drive_path for char in "\r\n\x00"):
+            errors.append("DRIVE_PATH cannot contain control characters")
+    try:
+        directory = Path(settings.csv_dir).expanduser()
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=directory):
+            pass
+    except (OSError, ValueError, TypeError):
+        errors.append("CSV_DIR must be a writable directory")
+    return errors
