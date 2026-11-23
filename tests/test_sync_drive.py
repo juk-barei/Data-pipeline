@@ -1,5 +1,6 @@
 import gzip
 import builtins
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -252,3 +253,60 @@ def test_sync_rejects_missing_or_empty_dataset(tmp_path, monkeypatch):
         drive.sync_to_drive(tmp_path / "missing", "drive", "")
     with pytest.raises(ValueError, match="No CSV"):
         drive.sync_to_drive(tmp_path, "drive", "")
+
+
+def confirm_mock_upload(tmp_path, monkeypatch, *, code=0, dry_run=False):
+    monkeypatch.setattr(drive, "ensure_rclone", lambda: "rclone")
+    monkeypatch.setattr(drive.subprocess, "run", Mock(return_value=SimpleNamespace(returncode=code)))
+    return drive.sync_to_drive(tmp_path, "drive", "", dry_run=dry_run)
+
+
+def test_delete_local_requires_actual_success_and_consumes_receipts(tmp_path, monkeypatch):
+    source = tmp_path / "accounts.csv"
+    source.write_bytes(b"address\nwallet\n")
+    with pytest.raises(ValueError, match="No successful sync"):
+        drive.delete_local([source])
+    assert source.exists()
+    confirm_mock_upload(tmp_path, monkeypatch)
+    assert drive.delete_local([source, source]) is None
+    assert not source.exists()
+    assert drive._confirmed_uploads == {}
+
+
+@pytest.mark.parametrize("code,dry_run", [(1, False), (0, True)])
+def test_delete_local_preserves_files_after_failed_or_dry_sync(tmp_path, monkeypatch, code, dry_run):
+    source = tmp_path / "accounts.csv"
+    source.write_bytes(b"address\nwallet\n")
+    confirm_mock_upload(tmp_path, monkeypatch, code=code, dry_run=dry_run)
+    with pytest.raises(ValueError, match="No successful sync"):
+        drive.delete_local([source])
+    assert source.exists()
+
+
+@pytest.mark.parametrize("restore_metadata", [False, True])
+def test_delete_local_rejects_changed_content_even_with_same_metadata(tmp_path, monkeypatch, restore_metadata):
+    source = tmp_path / "accounts.csv"
+    source.write_bytes(b"address\nwallet\n")
+    confirm_mock_upload(tmp_path, monkeypatch)
+    before = source.stat()
+    source.write_bytes(b"address\nNEW123\n")
+    if restore_metadata:
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(ValueError, match="File changed"):
+        drive.delete_local([source])
+    assert source.read_bytes() == b"address\nNEW123\n"
+
+
+def test_delete_local_preflights_entire_request_before_deleting_any(tmp_path, monkeypatch):
+    uploaded = tmp_path / "accounts.csv"
+    uploaded.write_bytes(b"address\nwallet\n")
+    confirm_mock_upload(tmp_path, monkeypatch)
+    unconfirmed = tmp_path / "new.csv"
+    unconfirmed.write_bytes(b"not uploaded")
+    with pytest.raises(ValueError, match="No successful sync"):
+        drive.delete_local([uploaded, unconfirmed])
+    assert uploaded.exists() and unconfirmed.exists()
+
+
+def test_delete_local_empty_request_is_noop():
+    assert drive.delete_local([]) is None

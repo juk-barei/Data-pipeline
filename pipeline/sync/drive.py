@@ -162,3 +162,37 @@ def sync_to_drive(
         if result.returncode == 0 and not dry_run:
             _confirmed_uploads.update(receipts)
         return result.returncode
+
+
+def delete_local(files: list[Path]) -> None:
+    """Delete only unchanged files confirmed uploaded by this process.
+
+    Callers must stop dataset writers before deletion. Preflight every requested
+    file before deleting any; receipts are single-use and require a real sync
+    after process restart, failed upload, or dry run.
+    """
+    candidates = []
+    for supplied in files:
+        path = Path(supplied)
+        if path.is_symlink():
+            raise ValueError("Refusing to delete a symlink")
+        candidates.append(path.resolve(strict=True))
+    candidates = list(dict.fromkeys(candidates))
+    for path in candidates:
+        receipt = _confirmed_uploads.get(path)
+        if receipt is None:
+            raise ValueError(f"No successful sync receipt for {path.name}")
+        signature, digest = receipt
+        if (
+            _file_signature(path) != signature
+            or _sha256(path) != digest
+            or _file_signature(path) != signature
+        ):
+            raise ValueError(f"File changed since successful sync: {path.name}")
+    for path in candidates:
+        # Recheck metadata immediately before unlinking; writers must still be
+        # quiescent because an ordinary filesystem unlink has no compare step.
+        if path.is_symlink() or _file_signature(path) != _confirmed_uploads[path][0]:
+            raise ValueError(f"File changed before deletion: {path.name}")
+        path.unlink()
+        del _confirmed_uploads[path]
