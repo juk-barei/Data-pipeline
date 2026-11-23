@@ -10,6 +10,7 @@ dependencies = ["python-dotenv>=1.0,<2", "httpx[http2]>=0.28,<1"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9"]
+parquet = ["pyarrow>=14"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

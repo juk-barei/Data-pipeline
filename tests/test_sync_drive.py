@@ -1,4 +1,5 @@
 import gzip
+import builtins
 
 import pytest
 
@@ -86,3 +87,67 @@ def test_gzip_empty_input_roundtrips(tmp_path):
     source = tmp_path / "empty.csv"
     source.write_bytes(b"")
     assert gzip.decompress(drive.compress_gzip(source).read_bytes()) == b""
+
+
+def test_parquet_roundtrip_preserves_strings_and_uses_bounded_batches(tmp_path):
+    parquet = pytest.importorskip("pyarrow.parquet")
+    source = tmp_path / "transactions.csv"
+    row = '000123,99999999999999999999999999,"line one\nline two",\n'
+    source.write_text("address,amount,note,empty\n" + row * 30_000, encoding="utf-8", newline="")
+    result = drive.csv_to_parquet(source)
+    metadata = parquet.ParquetFile(result)
+    assert metadata.metadata.num_row_groups > 1
+    assert metadata.metadata.row_group(0).column(0).compression == "ZSTD"
+    values = metadata.read().to_pydict()
+    assert values["address"] == ["000123"] * 30_000
+    assert values["amount"] == ["99999999999999999999999999"] * 30_000
+    assert values["note"] == ["line one\nline two"] * 30_000
+    assert values["empty"] == [""] * 30_000
+    pandas = pytest.importorskip("pandas")
+    assert pandas.read_parquet(result).iloc[0].to_dict() == {
+        "address": "000123", "amount": "99999999999999999999999999",
+        "note": "line one\nline two", "empty": "",
+    }
+
+
+def test_parquet_header_only_has_readable_schema(tmp_path):
+    parquet = pytest.importorskip("pyarrow.parquet")
+    source = tmp_path / "accounts.csv"
+    source.write_text("address,created_at\n", encoding="utf-8")
+    result = parquet.read_table(drive.csv_to_parquet(source))
+    assert result.num_rows == 0
+    assert result.column_names == ["address", "created_at"]
+
+
+def test_parquet_invalid_input_preserves_existing_export_and_cleans_temp(tmp_path):
+    arrow = pytest.importorskip("pyarrow")
+    source = tmp_path / "accounts.csv"
+    source.write_text("a,b\none,two,three\n", encoding="utf-8")
+    destination = source.with_suffix(".parquet")
+    destination.write_bytes(b"previous export")
+    with pytest.raises(arrow.ArrowInvalid, match="CSV parse error"):
+        drive.csv_to_parquet(source)
+    assert destination.read_bytes() == b"previous export"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["accounts.csv", "accounts.parquet"]
+
+
+@pytest.mark.parametrize("content", ["", "a,a\n", "a,\n"])
+def test_parquet_requires_unique_nonempty_header(tmp_path, content):
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "invalid.csv"
+    source.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="header"):
+        drive.csv_to_parquet(source)
+
+
+def test_parquet_missing_optional_dependency_has_install_hint(tmp_path, monkeypatch):
+    original_import = builtins.__import__
+
+    def without_arrow(name, *args, **kwargs):
+        if name == "pyarrow":
+            raise ImportError("not installed")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_arrow)
+    with pytest.raises(ImportError, match=r"tron-data-pipeline\[parquet\]"):
+        drive.csv_to_parquet(tmp_path / "unused.csv")
